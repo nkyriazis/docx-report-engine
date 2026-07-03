@@ -36,7 +36,10 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/nkyriazis/docx-report-engine
+          # ghcr.io/<owner>/<repo> — resolves to the fork's own namespace,
+          # so a fork's CI publishes to its own package instead of trying
+          # (and failing) to push to nkyriazis/docx-report-engine.
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=sha,prefix=
             type=raw,value=latest

@@ -59,7 +59,9 @@ docker run --rm -v "$PWD:/app" ghcr.io/nkyriazis/docx-report-engine:latest build
 The image is rebuilt and pushed by CI (`.github/workflows/publish-image.yml`,
 authenticated with the workflow's own `GITHUB_TOKEN`) on every push to `main`
 that touches the engine or the Dockerfile. Tags: `latest` plus the commit SHA
-for pinning.
+for pinning. The image name follows `github.repository`, so a fork's CI
+publishes to that fork's own `ghcr.io/<owner>/docx-report-engine` package —
+no edits needed after forking.
 
 Note: GHCR packages start out private regardless of repository visibility.
 Until the package is made public (Package settings → Danger Zone → Change
