@@ -231,7 +231,7 @@ def validate_docx_integrity(docx_path: str) -> dict:
     root = ET.fromstring(doc_xml)
 
     text_nodes = [el.text or "" for el in root.findall(".//w:t", xml_ns)]
-    doc_text = "\n".join(text_nodes)
+    doc_text = "".join(text_nodes)
 
     leftover_sentinels = doc_text.count("@@SECREF:") + doc_text.count("@@SECLABEL:") + doc_text.count("@@FIGREF:") + doc_text.count("@@TABREF:")
     leftover_raw_ref = doc_text.count(":ref{") + doc_text.count(":fig{") + doc_text.count(":tab{")

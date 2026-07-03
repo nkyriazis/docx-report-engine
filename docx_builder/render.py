@@ -1025,80 +1025,73 @@ def _post_process_crossrefs(
             first_run.addnext(bm_end)
 
     # --- Phase 1c: Repair sentinels split across runs by pandoc math rendering ---
-    # Pandoc may split @@SECREF:id@@ across adjacent w:r elements (e.g. @ | @SECREF:id | @@).
-    # Scan each paragraph's combined text and rejoin fractured runs.
+    # Pandoc may split @@SECREF:id@@ / @@FIGREF:id@@ / @@TABREF:id@@ across
+    # adjacent w:r elements (e.g. @ | @FIGREF:id | @@). A paragraph can contain
+    # several such sentinels back-to-back, so keep repairing until none remain.
+    _RE_ANY_SENT = re.compile(r'@@(?:SECREF|FIGREF|TABREF):[^@]+@@')
     for para in all_paras:
         p = para._p
-        runs = list(p.findall(f'{{{W}}}r'))
-        combined = ''.join(t.text or ''
-                           for r in runs
-                           for t in r.findall(f'{{{W}}}t'))
-        full_match = _RE_SECREF_SENT.search(combined)
-        if not full_match:
-            continue
-        already_ok = any(
-            _RE_SECREF_SENT.search(t.text or '')
-            for r in runs
-            for t in r.findall(f'{{{W}}}t')
-        )
-        if already_ok:
-            continue
-        # Find target runs via cumulative offsets
-        offsets: list[tuple[int, int, 'etree._Element']] = []
-        pos = 0
-        for r in runs:
-            rtext = ''.join(t.text or '' for t in r.findall(f'{{{W}}}t'))
-            offsets.append((pos, pos + len(rtext), r))
-            pos += len(rtext)
-        sent_start = full_match.start()
-        sent_end   = full_match.end()
-        target_runs = [r for s, e, r in offsets
-                       if s < sent_end and e > sent_start]
-        if not target_runs:
-            continue
-        merged_parts: list[str] = []
-        other_runs: list['etree._Element'] = []
-        for r in runs:
-            rtext = ''.join(t.text or '' for t in r.findall(f'{{{W}}}t'))
-            if r in target_runs:
-                merged_parts.append(rtext)
+        while True:
+            runs = list(p.findall(f'{{{W}}}r'))
+            segments: list[tuple[int, int, 'etree._Element', str]] = []
+            pos = 0
+            for r in runs:
+                rtext = ''.join(t.text or '' for t in r.findall(f'{{{W}}}t'))
+                segments.append((pos, pos + len(rtext), r, rtext))
+                pos += len(rtext)
+            combined = ''.join(s[3] for s in segments)
+
+            broken = None
+            for m in _RE_ANY_SENT.finditer(combined):
+                spanning = [s for s in segments if s[0] < m.end() and s[1] > m.start()]
+                if len(spanning) > 1:
+                    broken = (m, spanning)
+                    break
+            if broken is None:
+                break
+
+            m, spanning = broken
+            target_runs = [s[2] for s in spanning]
+            merged_text = ''.join(s[3] for s in spanning)
+            m2 = _RE_ANY_SENT.search(merged_text)
+            if not m2:
+                break
+            prefix = merged_text[:m2.start()]
+            suffix = merged_text[m2.end():]
+            # Build replacement runs: prefix (optional), sentinel run, suffix (optional)
+            new_runs: list['etree._Element'] = []
+            if prefix:
+                pr = OxmlElement('w:r')
+                pt = OxmlElement('w:t')
+                pt.set(XML_SPACE, 'preserve')
+                pt.text = prefix
+                pr.append(pt)
+                new_runs.append(pr)
+            sr = copy.deepcopy(target_runs[0])
+            for st in sr.findall(f'{{{W}}}t'):
+                st.text = m2.group(0)
+            new_runs.append(sr)
+            if suffix:
+                su = OxmlElement('w:r')
+                sut = OxmlElement('w:t')
+                sut.set(XML_SPACE, 'preserve')
+                sut.text = suffix
+                su.append(sut)
+                new_runs.append(su)
+            # Anchor insertion at the run immediately following the split block
+            # (positionally correct for mid-paragraph splits, not just paragraph-initial ones).
+            last_target_idx = max(runs.index(r) for r in target_runs)
+            next_run = runs[last_target_idx + 1] if last_target_idx + 1 < len(runs) else None
+            for r in target_runs:
+                p.remove(r)
+            if next_run is not None:
+                # addprevious on a fixed anchor: each call lands immediately
+                # before it, so iterate in forward order to keep new_runs in sequence.
+                for nr in new_runs:
+                    next_run.addprevious(nr)
             else:
-                other_runs.append(r)
-        merged_text = ''.join(merged_parts)
-        m2 = _RE_SECREF_SENT.search(merged_text)
-        if not m2:
-            continue
-        prefix = merged_text[:m2.start()]
-        suffix = merged_text[m2.end():]
-        # Build replacement runs: prefix (optional), sentinel run, suffix (optional)
-        new_runs: list['etree._Element'] = []
-        if prefix:
-            pr = OxmlElement('w:r')
-            pt = OxmlElement('w:t')
-            pt.set(XML_SPACE, 'preserve')
-            pt.text = prefix
-            pr.append(pt)
-            new_runs.append(pr)
-        sr = copy.deepcopy(target_runs[0])
-        for st in sr.findall(f'{{{W}}}t'):
-            st.text = m2.group(0)
-        new_runs.append(sr)
-        if suffix:
-            su = OxmlElement('w:r')
-            sut = OxmlElement('w:t')
-            sut.set(XML_SPACE, 'preserve')
-            sut.text = suffix
-            su.append(sut)
-            new_runs.append(su)
-        # Replace target runs in paragraph
-        for r in target_runs:
-            p.remove(r)
-        insert_anchor = other_runs[0] if other_runs else None
-        for nr in reversed(new_runs):
-            if insert_anchor is not None:
-                insert_anchor.addprevious(nr)
-            else:
-                p.append(nr)
+                for nr in new_runs:
+                    p.append(nr)
 
     # --- Phase 2: Process cross-reference sentinels in all paragraphs ---
     # Iterate raw w:p elements so paragraphs inside lxml-built figure tables
