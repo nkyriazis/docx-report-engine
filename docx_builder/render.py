@@ -1295,7 +1295,7 @@ def _validate_template_context(tpl: DocxTemplate, context: dict) -> None:
 def render(
     template_path: str,
     context: dict,
-    body_var_name: str,
+    body_var_name: str | list[str],
     output_path: str,
     image_base: str = '.',
     figure_title_style: str = 'FImageTitle',
@@ -1306,7 +1306,15 @@ def render(
         template_path: Path to the Jinja-instrumented DOCX (from the project's
                        template prep script).
         context:       Context dict (from the VAR blocks + parsed body).
-        body_var_name: Key in context that holds the ContentNode list.
+        body_var_name: Key(s) in context holding ContentNode lists. A single
+                       name for the common one-freeform-VAR template; a list
+                       of names for a fixed-structure template with multiple
+                       independent content loops (see the jinjify-template
+                       skill). All lists are concatenated before figure/table
+                       numbering and math/inline-run sentinel assignment so
+                       numbering and cross-references stay consistent across
+                       the whole document, then split back apart so each VAR
+                       renders through its own template loop.
         output_path:   Destination DOCX file.
         image_base:    Directory to search for figure image files.
         figure_title_style:
@@ -1320,8 +1328,17 @@ def render(
     sec = Document(template_path).sections[0]
     text_width = sec.page_width - sec.left_margin - sec.right_margin
 
-    # Get content nodes from context
-    content_nodes: list[ContentNode] = context[body_var_name]
+    body_var_names = [body_var_name] if isinstance(body_var_name, str) else list(body_var_name)
+
+    # Concatenate every freeform VAR's content nodes so figure/table numbers
+    # and math/inline sentinels are assigned once, globally, in draft order —
+    # not reset to zero (and colliding) at each VAR's boundary.
+    content_nodes: list[ContentNode] = []
+    boundaries: list[tuple[str, int]] = []
+    for name in body_var_names:
+        nodes = context[name]
+        content_nodes.extend(nodes)
+        boundaries.append((name, len(nodes)))
 
     # Finalize: assign sequential figure/table numbers, build maps
     figures_list, tables_list, fig_map, tab_map = finalize_content(content_nodes)
@@ -1329,8 +1346,11 @@ def render(
     # Build content proxy list (assigns math counters)
     content_proxies, inline_map = _build_content_proxies(content_nodes, tpl, img_base, text_width)
 
-    # Put proxies back into context
-    context[body_var_name] = content_proxies
+    # Split proxies back into each VAR's own list, in the template's context
+    offset = 0
+    for name, length in boundaries:
+        context[name] = content_proxies[offset:offset + length]
+        offset += length
 
     _validate_template_context(tpl, context)
 

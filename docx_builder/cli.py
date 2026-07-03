@@ -304,7 +304,7 @@ def _parse_csv_row(line: str, columns: tuple) -> dict:
 # Jinja DOCX build
 # ---------------------------------------------------------------------------
 
-def build_jinja_docx(context: dict, body_var: str, template_src: str, template_jinja: str,
+def build_jinja_docx(context: dict, body_vars: list[str], template_src: str, template_jinja: str,
                      output_docx: str, prep_path: str) -> None:
     prep = load_prep_module(prep_path)
     render_options = getattr(prep, "RENDER_OPTIONS", {})
@@ -313,7 +313,7 @@ def build_jinja_docx(context: dict, body_var: str, template_src: str, template_j
         print("  Instrumenting template...")
         prep.instrument_template(template_src, template_jinja)
 
-    render_jinja(template_jinja, context, body_var, output_docx,
+    render_jinja(template_jinja, context, body_vars, output_docx,
                  image_base=str(Path.cwd()), **render_options)
     print(f"  Done: {Path(output_docx).name}")
 
@@ -432,11 +432,11 @@ def build(
                 for k, v in sorted(acronyms_defs.items(), key=lambda kv: kv[0].lower())
             ],
         }
-        body_var = None
+        body_vars: list[str] = []
         for name, (vtype, columns, lines) in blocks.items():
             if vtype == "freeform":
                 context[name] = parse_body(lines)
-                body_var = name
+                body_vars.append(name)
             elif vtype == "table":
                 cols = tuple(columns.split(",")) if columns else ()
                 context[name] = [_parse_csv_row(l, cols) for l in lines if l.strip()]
@@ -453,7 +453,11 @@ def build(
         # -- Mermaid rendering -----------------------------------------------
         print("3. Mermaid rendering")
         report_obj.start_step("mermaid_rendering")
-        content_nodes = context.get(body_var, []) if body_var else []
+        # Concatenate every freeform VAR's nodes — a fixed-structure template
+        # (see the jinjify-template skill) has one content loop per chapter,
+        # each bound to its own VAR, and a Mermaid figure can land in any of
+        # them.
+        content_nodes = [node for name in body_vars for node in context.get(name, [])]
         text = render_mermaid(text, num_to_fid, content_nodes, figures_dir)
         report_obj.end_step("mermaid_rendering")
 
@@ -472,8 +476,8 @@ def build(
         else:
             print("4. Jinja DOCX")
             report_obj.start_step("docx_build")
-            template_jinja = "template_jinja.docx"
-            build_jinja_docx(context, body_var, template, template_jinja, output, prep)
+            template_jinja = f"{Path(template).stem}_jinja.docx"
+            build_jinja_docx(context, body_vars, template, template_jinja, output, prep)
             report_obj.end_step("docx_build")
 
             report_obj.start_step("docx_validation")

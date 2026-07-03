@@ -295,6 +295,42 @@ def insert_content_loop(
         sect_pr.addprevious(p)
 
 
+def force_decimal_numbering(doc, numid: int, lvl_text: str = '%1.') -> None:
+    """Force a numId's level-0 list definition to plain decimal (1., 2., ...).
+
+    Numbered-list content-loop items are assigned this numId directly, but
+    the abstractNum it references in the official template carries whatever
+    format Word last used there (bullet, lettered, "Annex %1 -", ...) — it
+    must be normalized per template, not assumed.
+    """
+    numbering = doc.part.numbering_part._element
+    abstract_id = None
+    for num in numbering.findall(f'{{{NS_W}}}num'):
+        if num.get(f'{{{NS_W}}}numId') == str(numid):
+            ref = num.find(f'{{{NS_W}}}abstractNumId')
+            abstract_id = ref.get(f'{{{NS_W}}}val') if ref is not None else None
+            break
+    if abstract_id is None:
+        return
+    for an in numbering.findall(f'{{{NS_W}}}abstractNum'):
+        if an.get(f'{{{NS_W}}}abstractNumId') != abstract_id:
+            continue
+        lvl0 = an.find(f'.//{{{NS_W}}}lvl[@{{{NS_W}}}ilvl="0"]')
+        if lvl0 is None:
+            return
+        num_fmt = lvl0.find(f'{{{NS_W}}}numFmt')
+        if num_fmt is None:
+            num_fmt = OxmlElement('w:numFmt')
+            lvl0.append(num_fmt)
+        num_fmt.set(f'{{{NS_W}}}val', 'decimal')
+        lvl_text_el = lvl0.find(f'{{{NS_W}}}lvlText')
+        if lvl_text_el is None:
+            lvl_text_el = OxmlElement('w:lvlText')
+            lvl0.append(lvl_text_el)
+        lvl_text_el.set(f'{{{NS_W}}}val', lvl_text)
+        return
+
+
 def get_or_make_spacing(pPr_el: etree._Element) -> etree._Element:
     """Get or create the w:spacing child of a pPr element."""
     sp = pPr_el.find(f'{{{NS_W}}}spacing')
