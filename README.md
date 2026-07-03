@@ -61,8 +61,10 @@ authenticated with the workflow's own `GITHUB_TOKEN`) on every push to `main`
 that touches the engine or the Dockerfile. Tags: `latest` plus the commit SHA
 for pinning.
 
-While this repository is private the image is private too, so pulls need a
-`docker login ghcr.io` with a token that has `read:packages`.
+Note: GHCR packages start out private regardless of repository visibility.
+Until the package is made public (Package settings → Danger Zone → Change
+visibility), pulls need a `docker login ghcr.io` with a token that has
+`read:packages`.
 
 ## Consuming from a downstream project
 
@@ -79,10 +81,8 @@ The Dockerfile bakes the engine at `/opt/engine` but puts a mounted
 and submodule stay interchangeable, and the image never needs a rebuild to
 test local engine changes.
 
-While this repository is private, cloning the submodule needs credentials:
-locally the `gh` credential helper (or an SSH `insteadOf` rewrite) covers the
-https URL; in CI pass a PAT with `repo` scope to `actions/checkout`'s `token`
-input alongside `submodules: true`.
+The repository is public, so cloning the submodule needs no credentials —
+in CI, `actions/checkout` with `submodules: true` just works.
 
 ## AI skill: adapting a new template
 
