@@ -5,24 +5,19 @@ Used by both build.py (compiled MD pipeline) and md_parser.py (DOCX pipeline).
 from __future__ import annotations
 import re
 
+import yaml
+
 # ---------------------------------------------------------------------------
-# YAML (simple key: value)
+# YAML (flat key: value mapping)
 # ---------------------------------------------------------------------------
 
 def load_yaml(path: str) -> dict[str, str]:
-    """Parse a simple key: value YAML file (no nesting, no lists)."""
-    defs: dict[str, str] = {}
+    """Load a flat key: value YAML mapping, coercing keys/values to str."""
     with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            key, _, value = line.partition(":")
-            key = key.strip().strip('"').strip("'")
-            value = value.strip().strip('"').strip("'")
-            if key:
-                defs[key] = value
-    return defs
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a flat key: value mapping")
+    return {str(k): ("" if v is None else str(v)) for k, v in data.items()}
 
 # ---------------------------------------------------------------------------
 # Acronym macros
