@@ -1,0 +1,21 @@
+# Downstream contract — set before `docker compose run`:
+#   DOCX_ENGINE_PROJECT_DIR  absolute path to the project to mount at /app
+#                            (draft/, template, acronyms.yml, ...)
+#   DOCX_ENGINE_TAG          image tag to run; recommended: the SHA of the
+#                            engine submodule's checked-out commit, so the
+#                            pinned source and the pinned image always match
+#   DOCX_ENGINE_IMAGE        override to point at a fork's own published
+#                            image instead of the canonical one
+#
+# If the resolved image:tag isn't found on the registry, Compose builds it
+# locally from ./Dockerfile automatically — no flag needed. That's the
+# normal path right after bumping the submodule to a commit whose image
+# hasn't finished publishing yet, or when iterating on an uncommitted
+# engine change.
+services:
+  engine:
+    image: ${DOCX_ENGINE_IMAGE:-ghcr.io/nkyriazis/docx-report-engine}:${DOCX_ENGINE_TAG:-latest}
+    build:
+      context: .
+    volumes:
+      - ${DOCX_ENGINE_PROJECT_DIR:-.}:/app
