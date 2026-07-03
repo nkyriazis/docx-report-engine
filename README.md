@@ -70,8 +70,6 @@ git submodule add https://github.com/nkyriazis/docx-report-engine.git engine
 The repository is public, so cloning the submodule needs no credentials —
 in CI, `actions/checkout` with `submodules: true` just works.
 
-### Via Docker Compose (recommended)
-
 `docker-compose.yml` at the engine's repo root is the intended entry point
 for a downstream project — it resolves the image to run, pulling the
 published one and falling back to a local build only if that tag isn't on
@@ -109,18 +107,11 @@ paths against its own project directory (the compose file's location by
 default), not the caller's `$PWD`, so a bare `.` would mount the wrong tree
 when the compose file lives one level down at `engine/`.
 
-### Via pip / PYTHONPATH (local, non-docker builds)
-
-```bash
-pip install -e engine   # or PYTHONPATH=engine
-```
-
 The Dockerfile bakes the engine at `/opt/engine` but puts a mounted
 `/app/engine` first on `PYTHONPATH`, so when a project mounts its repo at
-`/app` the submodule checkout takes precedence over the baked copy — image
-and submodule stay interchangeable, and the image never needs a rebuild to
-test local engine changes (this applies to both the raw `docker run` form
-and the Compose service above).
+`/app` (as the Compose service does) the submodule checkout takes
+precedence over the baked copy — image and submodule stay interchangeable,
+and the image never needs a rebuild to test local engine changes.
 
 ## AI skill: adapting a new template
 
