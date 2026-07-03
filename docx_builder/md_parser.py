@@ -2,7 +2,12 @@
 
 Two-pass pipeline:
   1. Structural: markdown-it-py AST → ContentNodes (headings, paragraphs, lists, tables, code fences)
-  2. Macros: detect figure/table/math patterns and transform
+  2. Macros: detect figure/table patterns and transform
+
+Inline formatting (bold, italic, code, math) is taken directly from the
+markdown-it inline token tree — there is no re-parsing of serialized text.
+The only regex layer left at the inline level handles syntax that is not
+markdown: :ref{}/:fig{}/:tab{} cross-references and color <span>s.
 
 Generic API:
   parse_body(lines) → list[ContentNode]
@@ -10,27 +15,30 @@ Generic API:
 from __future__ import annotations
 import re
 from markdown_it import MarkdownIt
+from mdit_py_plugins.dollarmath import dollarmath_plugin
 
 from .expansion import RE_ACRONYM
 from .schema import Run, ContentNode
 
 # ---------------------------------------------------------------------------
-# markdown-it-py instance (GFM tables supported via default preset)
+# markdown-it-py instance (GFM tables via default preset; $/$$ math via
+# dollarmath, which protects math content from emphasis parsing)
 # ---------------------------------------------------------------------------
-_mdit = MarkdownIt("default")
+_mdit = MarkdownIt("default").use(dollarmath_plugin)
 
 # ---------------------------------------------------------------------------
-# Compiled patterns — inline parsing (used by parse_inline)
+# Compiled patterns — non-markdown inline syntax (cross-refs, color spans)
 # ---------------------------------------------------------------------------
 RE_SECREF = re.compile(r':ref\{([^}]+)\}:')
 RE_FIGREF = re.compile(r':fig\{([^}]+)\}:')
 RE_TABREF = re.compile(r':tab\{([^}]+)\}:')
-RE_BOLD = re.compile(r'\*\*(.+?)\*\*')
-RE_ITALIC = re.compile(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)')
-RE_CODE = re.compile(r'`([^`]+)`')
-RE_HTML_SPAN = re.compile(
-    r'<span\s+style="([^"]*color:\s*([^;"]+))"[^>]*>(.+?)</span>',
-    re.DOTALL,
+
+_RE_INLINE_FEATURE = re.compile(
+    r'(?P<secref>:ref\{(?P<secid>[^}]+)\}:)'
+    r'|(?P<figref>:fig\{(?P<figid>[^}]+)\}:)'
+    r'|(?P<tabref>:tab\{(?P<tabid>[^}]+)\}:)'
+    r'|(?P<span_open><span\s+style="[^"]*color:\s*(?P<color>[^;"]+)[^"]*"[^>]*>)'
+    r'|(?P<span_close></span>)'
 )
 
 # ---------------------------------------------------------------------------
@@ -40,17 +48,12 @@ RE_FIG_MACRO = re.compile(r'^:fig\{([^}]+)\}:\s*(.*?)\s*(?:\[([^\]]+)\])?$')
 RE_TAB_MACRO = re.compile(r'^:tab\{([^}]+)\}:\s*(.*?)$')
 RE_WIDTH_HINT = re.compile(r'^(\d+(?:\.\d+)?)(%|cm)$')
 RE_HEADING_ID = re.compile(r'\s*\{#([^}]+)\}\s*$')
-RE_HAS_INLINE_MATH = re.compile(r'\$[^$\n]+\$')
 
 # ---------------------------------------------------------------------------
 # Mapping from Markdown heading depth to schema type
 # ---------------------------------------------------------------------------
 _HEADING_TYPE = {2: 'h1', 3: 'h2', 4: 'h3', 5: 'h4', 6: 'h4'}
 
-
-# ---------------------------------------------------------------------------
-# Inline parsing
-# ---------------------------------------------------------------------------
 
 def _refs_to_sentinels(text: str) -> str:
     """Convert :ref{id}:, :fig{id}:, and :tab{id}: tokens to sentinels."""
@@ -60,111 +63,160 @@ def _refs_to_sentinels(text: str) -> str:
     return text
 
 
-def parse_inline(text: str) -> list[Run]:
-    """Parse inline markdown into Runs."""
+# ---------------------------------------------------------------------------
+# Inline token tree → Runs
+# ---------------------------------------------------------------------------
+
+class _InlineState:
+    """Formatting state while walking an inline token tree."""
+    __slots__ = ('bold', 'italic', 'colors')
+
+    def __init__(self) -> None:
+        self.bold = 0
+        self.italic = 0
+        self.colors: list[str] = []
+
+    def make_run(self, text: str, **extra) -> Run:
+        return Run(
+            text=text,
+            bold=self.bold > 0,
+            italic=self.italic > 0,
+            color=self.colors[-1] if self.colors else '',
+            **extra,
+        )
+
+
+def _emit_text(text: str, state: _InlineState, runs: list[Run]) -> None:
+    """Split a text fragment on refs / color-span tags and emit Runs."""
     text = RE_ACRONYM.sub(lambda m: m.group(1), text)
-
-    runs: list[Run] = []
-    i = 0
-    while i < len(text):
-        m_bold = RE_BOLD.search(text, i)
-        m_ital = RE_ITALIC.search(text, i)
-        m_ref  = RE_SECREF.search(text, i)
-        m_fref = RE_FIGREF.search(text, i)
-        m_tref = RE_TABREF.search(text, i)
-        m_code = RE_CODE.search(text, i)
-        m_span = RE_HTML_SPAN.search(text, i)
-
-        candidates = []
-        if m_bold:  candidates.append((m_bold.start(),  0, m_bold))
-        if m_ital:  candidates.append((m_ital.start(),  1, m_ital))
-        if m_code:  candidates.append((m_code.start(),  2, m_code))
-        if m_span:  candidates.append((m_span.start(),  3, m_span))
-        if m_ref:   candidates.append((m_ref.start(),   4, m_ref))
-        if m_fref:  candidates.append((m_fref.start(),  5, m_fref))
-        if m_tref:  candidates.append((m_tref.start(),  6, m_tref))
-
-        if not candidates:
-            tail = text[i:]
-            if tail:
-                runs.append(Run(text=tail))
-            break
-
-        _, _, earliest = min(candidates)
-        before = text[i:earliest.start()]
+    pos = 0
+    for m in _RE_INLINE_FEATURE.finditer(text):
+        before = text[pos:m.start()]
         if before:
-            runs.append(Run(text=before))
+            runs.append(state.make_run(before))
+        if m.group('secref'):
+            rid = m.group('secid')
+            runs.append(state.make_run(f'@@SECREF:{rid}@@', ref_id=rid))
+        elif m.group('figref'):
+            fid = m.group('figid')
+            runs.append(state.make_run(f'@@FIGREF:{fid}@@', fig_ref_id=fid))
+        elif m.group('tabref'):
+            tid = m.group('tabid')
+            runs.append(state.make_run(f'@@TABREF:{tid}@@', tab_ref_id=tid))
+        elif m.group('span_open'):
+            state.colors.append(m.group('color').strip())
+        elif m.group('span_close'):
+            if state.colors:
+                state.colors.pop()
+        pos = m.end()
+    tail = text[pos:]
+    if tail:
+        runs.append(state.make_run(tail))
 
-        if earliest is m_bold:
-            bold_content = earliest.group(1)
-            if RE_SECREF.search(bold_content) or RE_FIGREF.search(bold_content) or RE_TABREF.search(bold_content):
-                inner_runs = parse_inline(bold_content)
-                for r in inner_runs:
-                    r.bold = True
-                runs.extend(inner_runs)
-            else:
-                runs.append(Run(text=bold_content, bold=True))
-        elif earliest is m_ital:
-            italic_content = earliest.group(1)
-            if RE_SECREF.search(italic_content) or RE_FIGREF.search(italic_content) or RE_TABREF.search(italic_content):
-                inner_runs = parse_inline(italic_content)
-                for r in inner_runs:
-                    r.italic = True
-                runs.extend(inner_runs)
-            else:
-                runs.append(Run(text=italic_content, italic=True))
-        elif earliest is m_code:
-            runs.append(Run(text=earliest.group(1), code=True))
-        elif earliest is m_span:
-            color_val = earliest.group(2).strip()
-            inner_text = earliest.group(3)
-            inner_runs = parse_inline(inner_text)
-            for r in inner_runs:
-                r.color = color_val
-            runs.extend(inner_runs)
-        elif earliest is m_ref:
-            ref_id = earliest.group(1)
-            runs.append(Run(text=f'@@SECREF:{ref_id}@@', ref_id=ref_id))
-        elif earliest is m_fref:
-            fig_id = earliest.group(1)
-            runs.append(Run(text=f'@@FIGREF:{fig_id}@@', fig_ref_id=fig_id))
+
+def _merge_adjacent(runs: list[Run]) -> list[Run]:
+    """Merge neighboring plain-text runs with identical formatting."""
+    merged: list[Run] = []
+    for run in runs:
+        prev = merged[-1] if merged else None
+        if (
+            prev is not None
+            and not (prev.ref_id or prev.fig_ref_id or prev.tab_ref_id)
+            and not (run.ref_id or run.fig_ref_id or run.tab_ref_id)
+            and (prev.bold, prev.italic, prev.code, prev.color)
+            == (run.bold, run.italic, run.code, run.color)
+        ):
+            prev.text += run.text
         else:
-            tab_id = earliest.group(1)
-            runs.append(Run(text=f'@@TABREF:{tab_id}@@', tab_ref_id=tab_id))
+            merged.append(run)
+    return merged
 
-        i = earliest.end()
 
-    return runs
+def _runs_from_children(children: list) -> list[Run]:
+    """Build Runs by walking an inline token's children."""
+    state = _InlineState()
+    runs: list[Run] = []
+    for child in (children or []):
+        ct = child.type
+        if ct == 'text':
+            _emit_text(child.content, state, runs)
+        elif ct == 'code_inline':
+            if child.content:
+                runs.append(state.make_run(child.content, code=True))
+        elif ct == 'strong_open':
+            state.bold += 1
+        elif ct == 'strong_close':
+            state.bold -= 1
+        elif ct == 'em_open':
+            state.italic += 1
+        elif ct == 'em_close':
+            state.italic -= 1
+        elif ct == 'math_inline':
+            # kept verbatim; paragraphs with math are re-rendered from
+            # math_raw by the pandoc post-processing step
+            runs.append(state.make_run(f'${child.content}$'))
+        elif ct in ('softbreak', 'hardbreak'):
+            runs.append(state.make_run(' '))
+        elif ct == 'html_inline':
+            _emit_text(child.content, state, runs)
+        elif ct == 'image':
+            alt = child.content or ''
+            src = dict(child.attrs or {}).get('src', '')
+            runs.append(state.make_run(f'![{alt}]({src})'))
+    return _merge_adjacent(runs)
+
+
+def _has_inline_math(children: list) -> bool:
+    return any(c.type == 'math_inline' for c in (children or []))
+
+
+def parse_inline(text: str) -> list[Run]:
+    """Parse an inline markdown string into Runs."""
+    tokens = _mdit.parseInline(text or '')
+    if not tokens:
+        return []
+    return _runs_from_children(tokens[0].children)
 
 
 # ---------------------------------------------------------------------------
-# Inline text extraction from markdown-it-py tokens
+# Inline serializer — markdown source text for macro matching and pandoc
 # ---------------------------------------------------------------------------
 
 def _inline_text(inline_token) -> str:
-    """Assemble plain text from an inline token's children, preserving markdown syntax."""
+    """Assemble markdown text from an inline token's children.
+
+    One-way only: used for macro-pattern matching on raw lines, for table
+    cell strings, and as pandoc input for paragraphs with inline math.
+    Runs are never re-parsed from this.
+    """
     parts: list[str] = []
     for child in (inline_token.children or []):
         ct = child.type
-        if ct == "text":
+        if ct == 'text':
             parts.append(child.content)
-        elif ct == "code_inline":
-            parts.append(f"`{child.content}`")
-        elif ct == "strong_open":
-            parts.append("**")
-        elif ct == "strong_close":
-            parts.append("**")
-        elif ct == "em_open":
-            parts.append("*")
-        elif ct == "em_close":
-            parts.append("*")
-        elif ct in ("softbreak", "hardbreak"):
-            parts.append(" ")
-        elif ct == "image":
-            alt = child.content or ""
-            src = dict(child.attrs or {}).get("src", "")
-            parts.append(f"![{alt}]({src})")
-    return "".join(parts)
+        elif ct == 'code_inline':
+            parts.append(f'`{child.content}`')
+        elif ct in ('strong_open', 'strong_close'):
+            parts.append('**')
+        elif ct in ('em_open', 'em_close'):
+            parts.append('*')
+        elif ct == 'math_inline':
+            parts.append(f'${child.content}$')
+        elif ct in ('softbreak', 'hardbreak'):
+            parts.append(' ')
+        elif ct == 'html_inline':
+            parts.append(child.content)
+        elif ct == 'image':
+            alt = child.content or ''
+            src = dict(child.attrs or {}).get('src', '')
+            parts.append(f'![{alt}]({src})')
+    return ''.join(parts)
+
+
+def _math_raw(assembled: str) -> str:
+    """Pandoc input for a paragraph with inline math: acronym-stripped,
+    cross-references converted to sentinels."""
+    return _refs_to_sentinels(RE_ACRONYM.sub(lambda m: m.group(1), assembled))
 
 
 # ---------------------------------------------------------------------------
@@ -211,11 +263,10 @@ def _parse_paragraph(tokens: list, i: int) -> tuple[ContentNode, int]:
             ), i + 3)
 
     # Regular paragraph
-    runs = parse_inline(assembled)
-    node = ContentNode(type="p", runs=runs, _raw=assembled)
-    if RE_HAS_INLINE_MATH.search(assembled):
+    node = ContentNode(type="p", runs=_runs_from_children(children), _raw=assembled)
+    if _has_inline_math(children):
         node.has_math = True
-        node.math_raw = _refs_to_sentinels(RE_ACRONYM.sub(lambda m: m.group(1), assembled))
+        node.math_raw = _math_raw(assembled)
     return (node, i + 3)
 
 
@@ -232,13 +283,13 @@ def _parse_list_item(tokens: list, i: int, kind: str, depth: int) -> tuple[list[
         tk = tokens[j].type
         if tk == "paragraph_open":
             inline_tok = tokens[j + 1] if j + 1 < len(tokens) else None
-            item_text = _inline_text(inline_tok) if inline_tok else ""
-            runs = parse_inline(item_text)
+            children = (inline_tok.children or []) if inline_tok else []
+            runs = _runs_from_children(children)
             if runs:
                 node = ContentNode(type=kind, runs=runs, level=depth)
-                if RE_HAS_INLINE_MATH.search(item_text):
+                if _has_inline_math(children):
                     node.has_math = True
-                    node.math_raw = _refs_to_sentinels(RE_ACRONYM.sub(lambda m: m.group(1), item_text))
+                    node.math_raw = _math_raw(_inline_text(inline_tok))
                 nodes.append(node)
             j += 3  # paragraph_open + inline + paragraph_close
             break
@@ -304,6 +355,13 @@ def _structural_pass(tokens: list) -> list[ContentNode]:
             node, i = _parse_paragraph(tokens, i)
             nodes.append(node)
 
+        elif t == "math_block":
+            nodes.append(ContentNode(
+                type="math_display",
+                math_src=(tokens[i].content or "").strip(),
+            ))
+            i += 1
+
         elif t == "fence":
             if tokens[i].info and "mermaid" in tokens[i].info:
                 nodes.append(ContentNode(
@@ -339,11 +397,11 @@ def _structural_pass(tokens: list) -> list[ContentNode]:
 
 
 # ---------------------------------------------------------------------------
-# Macro pass — figure/table/math detection
+# Macro pass — figure/table detection
 # ---------------------------------------------------------------------------
 
 def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
-    """Detect and transform macro patterns: figures, tables, display math.
+    """Detect and transform macro patterns: figures and tables.
 
     Linear scan. State: pending figures/tables, current context ids.
     """
@@ -362,14 +420,9 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
             result.append(node)
             continue
 
-        # --- List items: pass through ---
-        if t in ("bullet", "numbered"):
+        # --- List items and display math: pass through ---
+        if t in ("bullet", "numbered", "math_display"):
             result.append(node)
-            continue
-
-        # --- Display math ---
-        if t == "p" and node._raw.startswith("$$") and node._raw.endswith("$$"):
-            result.append(ContentNode(type="math_display", math_src=node._raw[2:-2].strip()))
             continue
 
         raw = (getattr(node, "_raw", "") or "").strip()
