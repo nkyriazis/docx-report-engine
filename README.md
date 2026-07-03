@@ -42,14 +42,60 @@ Also available: `instrument-template` (force template re-instrumentation),
 Runtime dependencies beyond `pyproject.toml`: `pandoc` on PATH (math → OMML)
 and `mmdc` (mermaid-cli) for mermaid figures.
 
+## Docker service
+
+The published image bundles everything a build needs — Python deps, pandoc,
+mermaid-cli and its Chromium — so downstream projects need no local
+toolchain:
+
+```bash
+docker run --rm -v "$PWD:/app" ghcr.io/nkyriazis/docx-report-engine:latest build \
+  --draft draft/draft.md \
+  --template documents/template.docx \
+  --output report.docx \
+  --compiled compiled.md
+```
+
+The image is rebuilt and pushed by CI (`.github/workflows/publish-image.yml`,
+authenticated with the workflow's own `GITHUB_TOKEN`) on every push to `main`
+that touches the engine or the Dockerfile. Tags: `latest` plus the commit SHA
+for pinning.
+
+While this repository is private the image is private too, so pulls need a
+`docker login ghcr.io` with a token that has `read:packages`.
+
 ## Consuming from a downstream project
 
 Add as a git submodule and install:
 
 ```bash
-git submodule add <this-repo> engine
+git submodule add https://github.com/nkyriazis/docx-report-engine.git engine
 pip install -e engine   # or PYTHONPATH=engine
 ```
 
-The provided Dockerfile bakes the engine at `/opt/engine` and prefers a
-mounted `/app/engine` checkout, so image and submodule stay interchangeable.
+The Dockerfile bakes the engine at `/opt/engine` but puts a mounted
+`/app/engine` first on `PYTHONPATH`, so when a project mounts its repo at
+`/app` the submodule checkout takes precedence over the baked copy — image
+and submodule stay interchangeable, and the image never needs a rebuild to
+test local engine changes.
+
+While this repository is private, cloning the submodule needs credentials:
+locally the `gh` credential helper (or an SSH `insteadOf` rewrite) covers the
+https URL; in CI pass a PAT with `repo` scope to `actions/checkout`'s `token`
+input alongside `submodules: true`.
+
+## AI skill: adapting a new template
+
+`skills/jinjify-template/SKILL.md` teaches an AI agent to write a project's
+`template_prep.py` for any new organisation template. In a downstream Claude
+Code project, expose it with a symlink so it is discoverable as a skill:
+
+```bash
+mkdir -p .claude/skills
+ln -s ../../engine/skills/jinjify-template .claude/skills/jinjify-template
+```
+
+Then `/jinjify-template` (or just asking to adapt a new template) walks the
+agent through inventorying the DOCX, deciding the contract mapping, writing
+the prep script, and verifying the result against
+`docs/TEMPLATE_CONTRACT.md`.
