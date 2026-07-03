@@ -289,6 +289,9 @@ def _build_content_proxies(
         elif node.type == 'bullet' and node.has_math:
             math_para_n += 1
             proxies.append(BulletProxy(node, math_para_n))
+        elif node.type in {'p', 'numbered'} and node.has_math:
+            math_para_n += 1
+            proxies.append(HeadingProxy(node, math_counter=math_para_n))
         elif node.type in {'h1', 'h2', 'h3', 'h4', 'p', 'numbered'}:
             inline_n += 1
             key = f'@@INLINEFMT:{inline_n}@@'
