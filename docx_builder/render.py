@@ -14,7 +14,6 @@ import os
 import re
 import subprocess
 import tempfile
-import zipfile
 from pathlib import Path
 
 _RE_HAS_INLINE_MATH = re.compile(r'\$[^$\n]+\$')
@@ -1268,35 +1267,17 @@ def _post_process_image_wrapping(docx_path: str) -> None:
     print(f'Post-processed {len(inlines)} image(s) → Top and Bottom wrapping in {docx_path}')
 
 
-def _validate_template_context(template_path: str, context: dict) -> None:
+def _validate_template_context(tpl: DocxTemplate, context: dict) -> None:
     """Validate that template Jinja variables have corresponding context keys.
 
-    Extracts Jinja variable names from the template XML ({{ var }}, {%tr for ... in var %},
-    {%p for ... in var %}) and checks they exist in the context dict.
-
-    Args:
-        template_path: Path to the Jinja-instrumented DOCX.
-        context:       Render context dict.
+    Uses docxtpl's get_undeclared_template_variables() (jinja2's own AST
+    analysis), which sees every variable reference — including ones split
+    across Word runs or used in filters/conditions — and correctly excludes
+    loop-local variables.  Checks both directions against the context dict.
 
     Raises SystemExit on mismatch.
     """
-    # Patterns for Jinja variable references in the template
-    RE_JINJA_VAR = re.compile(r'\{\{\s*(\w+)\s*\}\}')
-    RE_JINJA_TR_FOR = re.compile(r'\{%\s*tr\s+for\s+\w+\s+in\s+(\w+)\s*%\}')
-    RE_JINJA_P_FOR = re.compile(r'\{%\s*p\s+for\s+\w+\s+in\s+(\w+)\s*%\}')
-
-    with zipfile.ZipFile(template_path) as zf:
-        xml_text = zf.read('word/document.xml').decode('utf-8')
-
-    # Collect variable names referenced in the template
-    template_vars = set()
-    template_vars.update(RE_JINJA_VAR.findall(xml_text))
-    template_vars.update(RE_JINJA_TR_FOR.findall(xml_text))
-    template_vars.update(RE_JINJA_P_FOR.findall(xml_text))
-
-    # Filter out docxtpl loop variables (e.g. 'item' in {%p for item in content %})
-    template_vars -= {'item'}
-
+    template_vars = tpl.get_undeclared_template_variables()
     context_keys = set(context.keys())
 
     errors = []
@@ -1358,7 +1339,7 @@ def render(
     # Put proxies back into context
     context[body_var_name] = content_proxies
 
-    _validate_template_context(template_path, context)
+    _validate_template_context(tpl, context)
 
     tpl.render(context)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
