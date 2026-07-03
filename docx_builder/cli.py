@@ -17,6 +17,7 @@ prep script (default: ./template_prep.py) that exports
 """
 from __future__ import annotations
 
+import csv
 import datetime
 import importlib.util
 import json
@@ -288,8 +289,14 @@ def _extract_vars(lines: list[str]) -> dict:
 
 
 def _parse_csv_row(line: str, columns: tuple) -> dict:
-    """Parse a pipe-delimited row into a dict keyed by columns."""
-    cells = [c.strip() for c in line.strip().split("|") if c.strip()]
+    """Parse a pipe-delimited row into a dict keyed by columns.
+
+    Uses csv semantics: cells are positional, so empty cells are preserved
+    (a bare split-and-drop would shift later columns left).  Optional
+    leading/trailing pipes are tolerated.
+    """
+    row = next(csv.reader([line.strip().strip("|")], delimiter="|"))
+    cells = [c.strip() for c in row]
     return {col: (cells[i] if i < len(cells) else "") for i, col in enumerate(columns)}
 
 
