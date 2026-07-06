@@ -167,11 +167,11 @@ def preflight_check(draft_text: str) -> dict:
 # Acronym / figure wrappers (preserve print side-effects)
 # ---------------------------------------------------------------------------
 
-def expand_acronyms(text: str, defs: dict[str, str]) -> str:
+def expand_acronyms(text: str, defs: dict[str, str]) -> tuple[str, set[str]]:
     text, seen = _expand_acronyms(text, defs)
     text = inject_acronym_table(text, seen, defs)
     print(f"   {len(seen)} acronyms expanded")
-    return text
+    return text, seen
 
 
 def expand_figures(text: str) -> tuple[str, dict[int, str]]:
@@ -421,15 +421,17 @@ def build(
         # -- Acronym expansion -----------------------------------------------
         print("1. Acronym expansion")
         report_obj.start_step("acronym_expansion")
-        text = expand_acronyms(draft_text, acronyms_defs)
+        text, used_acronyms = expand_acronyms(draft_text, acronyms_defs)
         report_obj.end_step("acronym_expansion")
 
         # -- Parse VAR blocks → context variables ----------------------------
         blocks = _extract_vars(text.splitlines())
+        # The DOCX abbreviations table lists only acronyms the draft uses,
+        # matching inject_acronym_table's behaviour on the compiled-md side.
         context: dict = {
             'acronyms': [
-                {"abbrev": k, "definition": v}
-                for k, v in sorted(acronyms_defs.items(), key=lambda kv: kv[0].lower())
+                {"abbrev": k, "definition": acronyms_defs[k]}
+                for k in sorted(used_acronyms, key=str.lower)
             ],
         }
         body_vars: list[str] = []
