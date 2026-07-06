@@ -70,11 +70,12 @@ def make_para(style_id: str, text: str, align: str | None = None) -> etree._Elem
 
 
 def set_cell_text(cell, text: str) -> None:
-    """Replace all runs in the first paragraph of a table cell."""
+    """Replace all runs (and inline content controls) in the first paragraph
+    of a table cell."""
     para = cell.paragraphs[0]
     p_el = para._p
-    # Remove existing runs
-    for r in p_el.findall(f'{{{NS_W}}}r'):
+    # Remove existing runs and inline SDTs (e.g. checkbox content controls)
+    for r in p_el.findall(f'{{{NS_W}}}r') + p_el.findall(f'{{{NS_W}}}sdt'):
         p_el.remove(r)
     # Add a single run
     r = OxmlElement('w:r')
@@ -83,6 +84,20 @@ def set_cell_text(cell, text: str) -> None:
     t.set(f'{{{NS_XML}}}space', 'preserve')
     r.append(t)
     p_el.append(r)
+
+
+def set_cell_text_full(cell, text: str) -> None:
+    """Replace the ENTIRE cell content with a single paragraph of `text`.
+
+    Unlike set_cell_text (which touches only the first paragraph), this
+    drops every paragraph after the first — for template cells that carry
+    multi-paragraph author guidance.
+    """
+    tc = cell._tc
+    paras = tc.findall(f'{{{NS_W}}}p')
+    for p in paras[1:]:
+        tc.remove(p)
+    set_cell_text(cell, text)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +154,7 @@ def instrument_table(
     cell_vars: list[str],
     endfor_tag: str,
     data_row_start: int = 2,  # first data row index (0-based)
+    delete_surplus: bool = True,
 ) -> None:
     """Instrument a table for docxtpl row looping.
 
@@ -147,7 +163,8 @@ def instrument_table(
       row  data_row_start       — becomes the {% tr for %} marker row
       row  data_row_start+1     — becomes the template row with {{ vars }}
       row  data_row_start+2     — becomes the {% tr endfor %} marker row
-      rows data_row_start+3+    — deleted
+      rows data_row_start+3+    — deleted (unless delete_surplus=False, for
+                                  tables where fixed rows follow the loop)
     """
     rows = table.rows
     for_row = rows[data_row_start]
@@ -170,10 +187,70 @@ def instrument_table(
         set_cell_text(cell, '')
 
     # Delete surplus rows
-    tbl_el = table._tbl
-    tr_els = tbl_el.findall(f'{{{NS_W}}}tr')
-    for tr in tr_els[data_row_start + 3:]:
-        tbl_el.remove(tr)
+    if delete_surplus:
+        tbl_el = table._tbl
+        tr_els = tbl_el.findall(f'{{{NS_W}}}tr')
+        for tr in tr_els[data_row_start + 3:]:
+            tbl_el.remove(tr)
+
+
+def wrap_block_loop(
+    first_el: etree._Element,
+    last_el: etree._Element,
+    for_tag: str,
+    endfor_tag: str,
+) -> None:
+    """Wrap a run of body elements (e.g. a caption paragraph + its table) in
+    a docxtpl paragraph-level loop, so the whole block is replicated once per
+    item — the mechanism for "table to be replicated for each WP" templates.
+
+    Inserts a `{%p for ... %}` paragraph before `first_el` and a
+    `{%p endfor %}` paragraph after `last_el`; docxtpl removes both marker
+    paragraphs at render time.
+    """
+    first_el.addprevious(make_para('Normal', for_tag))
+    last_el.addnext(make_para('Normal', endfor_tag))
+
+
+def jinjify_checkboxes(container_el: etree._Element, exprs: list[str | None]) -> None:
+    """Bind native w14:checkbox content controls to Jinja boolean expressions.
+
+    Finds every checkbox SDT under `container_el` in document order and
+    replaces its content-run text with a Jinja conditional rendering the
+    engine's @@CHK:1@@ / @@CHK:0@@ sentinel; the engine's checkbox post-pass
+    then sets w14:checked and the control's declared state glyph, leaving a
+    live, natively-checked control. A None expr skips that checkbox.
+
+    Fails loudly when the checkbox count does not match len(exprs) — a
+    mismatch means the template edition changed.
+    """
+    NS_W14 = 'http://schemas.microsoft.com/office/word/2010/wordml'
+    boxes = [
+        sdt for sdt in container_el.iter(f'{{{NS_W}}}sdt')
+        if sdt.find(f'.//{{{NS_W14}}}checkbox') is not None
+    ]
+    if len(boxes) != len(exprs):
+        raise RuntimeError(
+            f'jinjify_checkboxes: found {len(boxes)} checkbox controls, '
+            f'got {len(exprs)} expressions'
+        )
+    for sdt, expr in zip(boxes, exprs):
+        if expr is None:
+            continue
+        content = sdt.find(f'{{{NS_W}}}sdtContent')
+        runs = content.findall(f'.//{{{NS_W}}}r')
+        if not runs:
+            raise RuntimeError('jinjify_checkboxes: checkbox SDT has no content run')
+        # Keep the first run (its rPr carries the state-glyph font); drop the rest
+        for r in runs[1:]:
+            r.getparent().remove(r)
+        first = runs[0]
+        for t in first.findall(f'{{{NS_W}}}t'):
+            first.remove(t)
+        t = OxmlElement('w:t')
+        t.set(f'{{{NS_XML}}}space', 'preserve')
+        t.text = f"{{{{ '@@CHK:1@@' if {expr} else '@@CHK:0@@' }}}}"
+        first.append(t)
 
 
 # ---------------------------------------------------------------------------

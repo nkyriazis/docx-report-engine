@@ -29,6 +29,8 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import yaml
+
 from .expansion import (
     expand_acronyms as _expand_acronyms,
     inject_acronym_table,
@@ -233,7 +235,7 @@ def validate_docx_integrity(docx_path: str) -> dict:
     text_nodes = [el.text or "" for el in root.findall(".//w:t", xml_ns)]
     doc_text = "".join(text_nodes)
 
-    leftover_sentinels = doc_text.count("@@SECREF:") + doc_text.count("@@SECLABEL:") + doc_text.count("@@FIGREF:") + doc_text.count("@@TABREF:")
+    leftover_sentinels = doc_text.count("@@SECREF:") + doc_text.count("@@SECLABEL:") + doc_text.count("@@FIGREF:") + doc_text.count("@@TABREF:") + doc_text.count("@@CHK:")
     leftover_raw_ref = doc_text.count(":ref{") + doc_text.count(":fig{") + doc_text.count(":tab{")
     unresolved_refs = len(re.findall(r"\[\?[^\]]+\]", doc_text))
 
@@ -286,6 +288,78 @@ def _extract_vars(lines: list[str]) -> dict:
         if current is not None:
             buf.append(line)
     return blocks
+
+
+_CHECKLIST_ITEM = re.compile(r"^\s*[-*]\s*\[([ xX])\]\s*([\w-]+)\s*(?:[—:–-].*)?$")
+
+
+def _parse_checklist(name: str, lines: list[str]) -> dict:
+    """Parse a TYPE:checklist VAR body (GitHub task-list syntax) into a
+    key -> bool dict.
+
+    Each non-empty line must look like ``- [x] key`` or ``- [ ] key``,
+    optionally followed by a dash/colon note that is ignored. Keys drive
+    checkbox states in the template (``{{ name.key }}``).
+    """
+    out: dict = {}
+    for line in lines:
+        if not line.strip():
+            continue
+        m = _CHECKLIST_ITEM.match(line)
+        if not m:
+            raise ValueError(
+                f"VAR:{name} TYPE:checklist — line is not '- [x] key': {line!r}"
+            )
+        key = m.group(2)
+        if key in out:
+            raise ValueError(f"VAR:{name} TYPE:checklist — duplicate key {key!r}")
+        out[key] = m.group(1).lower() == "x"
+    return out
+
+
+_YAML_FENCE = re.compile(r"```(?:yaml|yml)?\s*\n(.*?)```", re.S)
+
+
+class _YamlLoader(yaml.SafeLoader):
+    """SafeLoader with YAML-1.2 booleans: only true/false, so that natural
+    field names like `no:` (a bool in YAML 1.1) stay strings."""
+
+
+_YamlLoader.yaml_implicit_resolvers = {
+    key: [(tag, regexp) for tag, regexp in resolvers
+          if tag != "tag:yaml.org,2002:bool"]
+    for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_YamlLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+    list("tTfF"),
+)
+
+
+def _strip_yaml_strings(value):
+    """Trim trailing newlines that folded/literal scalars carry — they would
+    render as spurious line breaks in DOCX cells."""
+    if isinstance(value, str):
+        return value.rstrip("\n")
+    if isinstance(value, list):
+        return [_strip_yaml_strings(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _strip_yaml_strings(v) for k, v in value.items()}
+    return value
+
+
+def _parse_yaml_block(name: str, lines: list[str]):
+    """Parse a TYPE:yaml VAR body. A ```yaml fence around the payload is
+    tolerated (and encouraged — it keeps the draft's markdown preview clean)."""
+    text = "\n".join(lines)
+    m = _YAML_FENCE.search(text)
+    if m:
+        text = m.group(1)
+    try:
+        return _strip_yaml_strings(yaml.load(text, Loader=_YamlLoader))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"VAR:{name} TYPE:yaml — invalid YAML: {exc}") from exc
 
 
 def _parse_csv_row(line: str, columns: tuple) -> dict:
@@ -450,6 +524,10 @@ def build(
             elif vtype == "table":
                 cols = tuple(columns.split(",")) if columns else ()
                 context[name] = [_parse_csv_row(l, cols) for l in lines if l.strip()]
+            elif vtype == "yaml":
+                context[name] = _parse_yaml_block(name, lines)
+            elif vtype == "checklist":
+                context[name] = _parse_checklist(name, lines)
             else:
                 context[name] = "\n".join(lines).strip()
         print(f"   Context variables: {', '.join(sorted(context.keys()))}")

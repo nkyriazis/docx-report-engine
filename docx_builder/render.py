@@ -33,6 +33,54 @@ _NS_A  = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 
 
 # ---------------------------------------------------------------------------
+# Structured-VAR image strings
+# ---------------------------------------------------------------------------
+
+# A structured VAR value (TYPE:yaml, TYPE:table cell, plain VAR) that is
+# exactly a markdown image — ![alt](path) with an optional [width] hint —
+# renders as a native inline image instead of text.
+_RE_IMG_STRING = re.compile(r'^!\[([^\]]*)\]\(([^)\s]+)\)\s*(?:\[([^\]]+)\])?$')
+
+
+def _width_from_hint(hint: str, text_width: int) -> int:
+    """Width in EMU from a '50%' / '7cm' hint; full text width otherwise."""
+    if hint.endswith('%'):
+        try:
+            return int(text_width * float(hint[:-1]) / 100)
+        except ValueError:
+            return text_width
+    if hint.endswith('cm'):
+        try:
+            return Cm(float(hint[:-2]))
+        except ValueError:
+            return text_width
+    return text_width
+
+
+def _convert_context_images(value, tpl: DocxTemplate, img_base: Path, text_width: int):
+    """Recursively replace markdown-image strings in a context value with
+    InlineImage objects (and YAML nulls with empty strings)."""
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        m = _RE_IMG_STRING.match(value.strip())
+        if not m:
+            return value
+        path = m.group(2)
+        width = _width_from_hint(m.group(3) or '', text_width)
+        full = Path(path) if Path(path).is_absolute() else img_base / path
+        if full.exists():
+            return InlineImage(tpl, str(full), width=width)
+        return RichText(f'[image not found: {path}]', italic=True)
+    if isinstance(value, list):
+        return [_convert_context_images(v, tpl, img_base, text_width) for v in value]
+    if isinstance(value, dict):
+        return {k: _convert_context_images(v, tpl, img_base, text_width)
+                for k, v in value.items()}
+    return value
+
+
+# ---------------------------------------------------------------------------
 # Run list → RichText
 # ---------------------------------------------------------------------------
 
@@ -449,6 +497,55 @@ def _post_process_tables(docx_path: str, tables_list: list[ContentNode]) -> None
     if replaced:
         doc.save(docx_path)
         print(f'Post-processed {replaced} table(s) into {docx_path}')
+
+
+_NS_W14 = 'http://schemas.microsoft.com/office/word/2010/wordml'
+_RE_CHK_SENTINEL = re.compile(r'@@CHK:([01])@@')
+
+
+def _post_process_checkboxes(docx_path: str) -> None:
+    """Sync native w14:checkbox controls from rendered @@CHK:x@@ sentinels.
+
+    A prep script opts a checkbox in by replacing its content-run text with a
+    Jinja expression that renders '@@CHK:1@@' or '@@CHK:0@@'
+    (template_tools.jinjify_checkboxes). This pass sets w14:checked and the
+    state glyph declared by the control itself — byte-for-byte what Word
+    writes when a user clicks the box, so the control stays live. Documents
+    with no sentinels are left untouched.
+    """
+    from docx import Document as DocxDocument
+
+    doc = DocxDocument(docx_path)
+    changed = 0
+    for sdt in doc.element.body.iter(f'{{{_NS_W}}}sdt'):
+        checkbox = sdt.find(f'.//{{{_NS_W14}}}checkbox')
+        content = sdt.find(f'{{{_NS_W}}}sdtContent')
+        if checkbox is None or content is None:
+            continue
+        t_els = content.findall(f'.//{{{_NS_W}}}t')
+        m = _RE_CHK_SENTINEL.fullmatch(''.join(t.text or '' for t in t_els).strip())
+        if not m:
+            continue
+        checked = m.group(1) == '1'
+
+        state_tag = 'checkedState' if checked else 'uncheckedState'
+        state = checkbox.find(f'{{{_NS_W14}}}{state_tag}')
+        glyph = '☒' if checked else '☐'
+        if state is not None and state.get(f'{{{_NS_W14}}}val'):
+            glyph = chr(int(state.get(f'{{{_NS_W14}}}val'), 16))
+
+        checked_el = checkbox.find(f'{{{_NS_W14}}}checked')
+        if checked_el is not None:
+            checked_el.set(f'{{{_NS_W14}}}val', '1' if checked else '0')
+
+        t_els[0].text = glyph
+        for t in t_els[1:]:
+            t.text = ''
+        changed += 1
+
+    if changed:
+        doc.save(docx_path)
+        print(f'Post-processed {changed} checkbox(es) in {docx_path}')
 
 
 def _post_process_math(docx_path: str, content_proxies: list) -> None:
@@ -1352,6 +1449,12 @@ def render(
         context[name] = content_proxies[offset:offset + length]
         offset += length
 
+    # Structured (non-body) VARs: markdown-image strings → native InlineImage
+    body_set = set(body_var_names)
+    for key in context:
+        if key not in body_set:
+            context[key] = _convert_context_images(context[key], tpl, img_base, text_width)
+
     _validate_template_context(tpl, context)
 
     tpl.render(context)
@@ -1371,4 +1474,6 @@ def render(
                             figure_title_style)
     # Post-process: convert inline images to Top and Bottom wrapping
     _post_process_image_wrapping(output_path)
+    # Post-process: sync native w14:checkbox controls from @@CHK:x@@ sentinels
+    _post_process_checkboxes(output_path)
     print(f'Rendered → {output_path}')

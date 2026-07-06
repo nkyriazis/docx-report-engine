@@ -64,8 +64,24 @@ Jane Doe|ACME|jane@acme.org
 - `TYPE:table` → list of dicts keyed by `COLUMNS` (rows are pipe-delimited);
   render with a `{%tr for ... %}` row loop (`template_tools.instrument_table`).
 - `TYPE:freeform` → the parsed document body (list of content nodes);
-  exactly one per draft; render with the content loop (§3).
+  one per fillable region (a fixed-structure template may have several);
+  render with the content loop (§3).
+- `TYPE:yaml` → the block parsed as YAML (a ```yaml fence around the payload
+  is tolerated and keeps the markdown preview clean). For nested data that
+  pipe-rows cannot express — e.g. a per-WP dossier with a deliverables list —
+  rendered with block-table loops (§4a) and nested `{%tr for %}` loops.
+  Booleans follow YAML 1.2: only `true`/`false` — `no:`/`yes:` stay strings,
+  so they're safe as field names. Trailing newlines of folded/literal
+  scalars are stripped (they would render as spurious breaks in cells).
+- `TYPE:checklist` → GitHub task-list lines (`- [x] key` / `- [ ] key`,
+  an optional dash/colon note after the key is ignored) parsed into a
+  `key → bool` dict; drives native checkboxes (§4b) via `{{ name.key }}`.
 - any other `TYPE` → plain string.
+
+In any non-freeform value, a string that is exactly a markdown image —
+`![alt](path)` with an optional `[50%]`/`[7cm]` width hint — is replaced by a
+native inline image at render time (missing files degrade to an italic
+`[image not found: …]` note).
 
 The engine always adds `acronyms`: a list of `{abbrev, definition}` dicts for
 the acronyms actually used, sorted case-insensitively.
@@ -113,7 +129,7 @@ drafts must not produce them by other means:
 
 `TABLE_PLACEHOLDER_N`, `MATH_DISP_N`, `MATH_PARA_N`, `MATH_CAP_N`,
 `FIGURE_START_N` / `FIGURE_END_N`, `@@INLINEFMT:n@@`, `@@SECLABEL:id@@`,
-`@@SECREF:id@@`, `@@FIGREF:id@@`, `@@TABREF:id@@`.
+`@@SECREF:id@@`, `@@FIGREF:id@@`, `@@TABREF:id@@`, `@@CHK:0@@` / `@@CHK:1@@`.
 
 ## 4. Front matter
 
@@ -129,6 +145,27 @@ typical prep-script work:
 - apply organisation-specific style corrections (alignment, bullets, fonts).
 
 Fields are inserted dirty, so Word regenerates TOC/LOF/LOT on open.
+
+### 4a. Replicated table blocks
+
+Templates that say "table to be replicated for each WP" are handled by
+`template_tools.wrap_block_loop`: a `{%p for wp in <var> %}` paragraph before
+the block (caption paragraph + table) and `{%p endfor %}` after it. docxtpl
+repeats everything in between per item and removes the marker paragraphs.
+Inside the block use `{{ wp.field }}` in cells, `{{ loop.index }}` for the
+"Table 2.X" numbering, and nested `{%tr for d in wp.deliverables %}` row
+loops for variable-length sub-lists. Cells whose template text spans several
+guidance paragraphs should be cleared with `set_cell_text_full`.
+
+### 4b. Native checkboxes
+
+`w14:checkbox` content controls stay live: the prep script binds each one to
+a Jinja boolean expression with `template_tools.jinjify_checkboxes`, which
+makes the control render a `@@CHK:1@@`/`@@CHK:0@@` sentinel; the engine's
+checkbox post-pass then writes `w14:checked` and the control's own declared
+state glyph — exactly what Word writes when a user ticks the box. Drive the
+expressions from `TYPE:checklist` dicts (`checks.key` / `not checks.key` for
+Yes/No pairs) or from enum-valued plain VARs (`report_type == 'interim'`).
 
 ## 5. Cross-references
 
