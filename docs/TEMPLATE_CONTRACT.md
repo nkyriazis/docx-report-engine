@@ -6,8 +6,9 @@ things next to its draft:
 1. **`template_prep.py`** — a script that turns the organisation's official
    DOCX template into a Jinja-instrumented template (written once per
    template, usually by an AI following the `jinjify-template` skill).
-2. **The instrumented template** (`template_jinja.docx`) — its deterministic
-   output, regenerated automatically by the build when missing.
+2. **The instrumented template** (`<template-stem>_jinja.docx`) — its
+   deterministic output, regenerated automatically by the build when missing
+   or older than the source template or the prep script.
 
 The engine (`docx_builder`) never contains template-specific knowledge:
 heading texts, style IDs, table layouts and TOC instructions all live in the

@@ -309,7 +309,15 @@ def build_jinja_docx(context: dict, body_vars: list[str], template_src: str, tem
     prep = load_prep_module(prep_path)
     render_options = getattr(prep, "RENDER_OPTIONS", {})
 
-    if not Path(template_jinja).exists():
+    # Re-instrument when the cached jinja template is missing or older than
+    # the source template / prep script — instrumentation is deterministic,
+    # so a fresh cache is always safe and user edits are always honoured.
+    jinja = Path(template_jinja)
+    stale = not jinja.exists() or any(
+        Path(src).stat().st_mtime > jinja.stat().st_mtime
+        for src in (template_src, prep_path)
+    )
+    if stale:
         print("  Instrumenting template...")
         prep.instrument_template(template_src, template_jinja)
 
