@@ -374,6 +374,32 @@ def _parse_csv_row(line: str, columns: tuple) -> dict:
     return {col: (cells[i] if i < len(cells) else "") for i, col in enumerate(columns)}
 
 
+def _summarize_comment_assignments(context: dict, body_vars: list[str]) -> list[dict]:
+    """One entry per comment: which node it landed on and a text preview of
+    both sides, so a build reviewer can spot a misattached comment (e.g. one
+    whose text reads backward — "the claim above" — but that mechanically
+    attached to the node *after* it) without opening the rendered DOCX.
+    """
+    out: list[dict] = []
+    for name in body_vars:
+        for node in context[name]:
+            author = getattr(node, "comment_author", "")
+            if not author:
+                continue
+            target_text = "".join(r.text for r in node.runs).strip()
+            body_text = " / ".join(
+                "".join(r.text for r in para).strip()
+                for para in node.comment_body
+            )
+            out.append({
+                "author": author,
+                "target_type": node.type,
+                "target_preview": target_text[:80],
+                "comment_preview": body_text[:160],
+            })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Jinja DOCX build
 # ---------------------------------------------------------------------------
@@ -531,6 +557,20 @@ def build(
             else:
                 context[name] = "\n".join(lines).strip()
         print(f"   Context variables: {', '.join(sorted(context.keys()))}")
+
+        # -- Comment assignments: report what landed on what -----------------
+        # Comments attach to whichever node follows them, forward-only, with
+        # no positional restriction beyond the target's type. That's a real
+        # authoring footgun (a comment reading "the claim above" still
+        # attaches to whatever comes *after* it) the parser can't catch by
+        # itself — it can't tell intent from a body of quoted text. Surfacing
+        # every (target, comment) pairing here lets a build reviewer eyeball
+        # each one instead of trusting placement blindly.
+        comment_assignments = _summarize_comment_assignments(context, body_vars)
+        report_obj.add_metric("comment_assignments", comment_assignments)
+        if comment_assignments:
+            print(f"   {len(comment_assignments)} comment(s) attached — "
+                  f"review build_report.json metrics.comment_assignments")
 
         # -- Figure expansion ------------------------------------------------
         print("2. Figure expansion")

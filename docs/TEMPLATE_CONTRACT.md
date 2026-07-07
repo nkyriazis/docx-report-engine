@@ -208,6 +208,20 @@ error rather than silently degrading. This is deliberate — comments are
 meta-content about the draft, not draft content, so a malformed one
 should never quietly end up as (or vanish from) the shipped document.
 
+That strictness only constrains *what type* of node a comment may attach
+to — it says nothing about *where* in the document that's a good idea.
+Attachment is forward-only and purely positional (whatever content node
+comes next), so a comment worded as if it refers to preceding text (e.g.
+"needs a citation for the claim above") will still mechanically attach to
+whatever follows it — a real authoring footgun the parser has no way to
+catch, since it can't read intent out of the comment body. To make this
+checkable rather than just documented, every build reports each
+`(target, comment)` pairing — `build_report.json`'s
+`metrics.comment_assignments`, a list of `{author, target_type,
+target_preview, comment_preview}` — so a build reviewer can eyeball
+whether each comment landed where its text implies it should, without
+opening the rendered DOCX.
+
 The engine needs no template cooperation for this feature.
 
 ## 7. The markdown dialect (source side, for reference)
