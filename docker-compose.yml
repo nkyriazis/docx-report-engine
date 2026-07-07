@@ -15,6 +15,7 @@
 services:
   engine:
     image: ${DOCX_ENGINE_IMAGE:-ghcr.io/nkyriazis/docx-report-engine}:${DOCX_ENGINE_TAG:-latest}
+    pull_policy: always
     build:
       context: .
     volumes:

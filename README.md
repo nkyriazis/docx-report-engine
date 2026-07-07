@@ -96,8 +96,10 @@ publishes the image tags it with the same short SHA `git rev-parse --short`
 produces, so they're always the same string. **Updating the engine is then
 an explicit, reviewable `git submodule update --remote` + commit** — a
 step that shows up as an ordinary diff — rather than a floating `:latest`
-that silently drifts once Compose has it cached locally (Compose only
-pulls when the resolved tag isn't already present locally).
+that silently drifts. The compose file sets `pull_policy: always` on the
+service, so Compose always checks the registry for the resolved tag
+first (falling back to a local build only if that pull fails) instead of
+trusting a same-named image that's already cached locally.
 
 Other variables the compose file reads (see the file's header comment for
 the full contract): `DOCX_ENGINE_IMAGE` overrides the image (e.g. for a
