@@ -61,6 +61,14 @@ class ContentNode:
     sec_id: str = ''            # optional {#id} label from heading syntax
     sec_number: str = ''        # numeric prefix captured before stripping (e.g. '1.1')
 
+    # Comment fields — set when a strict `> comment: Author` blockquote
+    # immediately precedes this node in the draft. Renders as a native Word
+    # (OOXML) comment attached to this node's text, not as body content.
+    # Only h1-h4 / p / bullet / numbered nodes without inline math may carry
+    # one; comment_author non-empty means "this node has a comment".
+    comment_author: str = ''
+    comment_body: list[list[Run]] = field(default_factory=list)  # one list per comment paragraph
+
     # Internal — raw text for macro processing pass
     _raw: str = ''
 

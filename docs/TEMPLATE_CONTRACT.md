@@ -179,12 +179,43 @@ Yes/No pairs) or from enum-valued plain VARs (`report_type == 'interim'`).
 The engine needs no template cooperation for this beyond
 `figure_title_style` and heading styles with Word-native numbering.
 
-## 6. The markdown dialect (source side, for reference)
+## 6. Comments
+
+Blockquotes are reserved in this dialect for author comments — nothing
+else may use `>` syntax. The first line inside the blockquote must read
+`comment: <author>`; every other paragraph inside becomes one paragraph of
+the comment body:
+
+```markdown
+> comment: Nikos
+>
+> This attaches to the paragraph/heading immediately below.
+
+This is the commented text.
+```
+
+The comment attaches to whatever content unit follows it — a heading,
+plain paragraph, bullet, or numbered item (not figures, tables,
+math-display blocks, or paragraphs containing inline math). It renders as
+a real Word (OOXML) comment — a margin note attached to that text, with
+`author` set from the blockquote header — not as visible body content.
+
+Parsing is strict, by design: a blockquote that doesn't start with
+`comment: <author>`, a comment with no body, two comments in a row with
+nothing between them, a comment with nothing following it, or a comment
+attached to an unsupported node type, all fail the build with a clear
+error rather than silently degrading. This is deliberate — comments are
+meta-content about the draft, not draft content, so a malformed one
+should never quietly end up as (or vanish from) the shipped document.
+
+The engine needs no template cooperation for this feature.
+
+## 7. The markdown dialect (source side, for reference)
 
 `:KEY:` acronyms (expanded on first use), `:fig{id}:` / `:tab{id}:` /
 `:ref{id}:` cross-references, `{#label}` heading anchors,
 `**:fig{id}: Title** [width]` + image/mermaid + `*:fig{id}: caption*` figure
 groups, `**:tab{id}: Caption**` + GFM table groups, `$...$` / `$$...$$`
-math, ` ```mermaid ` fences. All degrade gracefully in a plain markdown
-preview — that property is a design goal; keep it when extending the
-dialect.
+math, ` ```mermaid ` fences, `> comment: Author` blockquotes (§6). All
+degrade gracefully in a plain markdown preview — that property is a design
+goal; keep it when extending the dialect.

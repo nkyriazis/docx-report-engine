@@ -48,6 +48,12 @@ RE_FIG_MACRO = re.compile(r'^:fig\{([^}]+)\}:\s*(.*?)\s*(?:\[([^\]]+)\])?$')
 RE_TAB_MACRO = re.compile(r'^:tab\{([^}]+)\}:\s*(.*?)$')
 RE_WIDTH_HINT = re.compile(r'^(\d+(?:\.\d+)?)(%|cm)$')
 RE_HEADING_ID = re.compile(r'\s*\{#([^}]+)\}\s*$')
+RE_COMMENT_HEADER = re.compile(r'^comment:\s*(\S.*)$')
+
+# Node types a blockquote comment is allowed to attach to — plain-text nodes
+# whose rendering goes through the @@INLINEFMT:n@@ placeholder path. Math
+# paragraphs, figures, tables, and math_display blocks are out of scope.
+_COMMENTABLE_TYPES = {'h1', 'h2', 'h3', 'h4', 'p', 'bullet', 'numbered'}
 
 # ---------------------------------------------------------------------------
 # Mapping from Markdown heading depth to schema type
@@ -270,6 +276,53 @@ def _parse_paragraph(tokens: list, i: int) -> tuple[ContentNode, int]:
     return (node, i + 3)
 
 
+def _parse_comment_blockquote(tokens: list, i: int) -> tuple[str, list[list[Run]], int]:
+    """Parse a `> comment: Author` blockquote. Strict: this dialect reserves
+    blockquotes for author comments — the first paragraph inside must read
+    exactly 'comment: <author>', and every other paragraph inside becomes one
+    paragraph of the comment body. Returns (author, body_paragraphs, i past
+    the blockquote_close).
+    """
+    assert tokens[i].type == "blockquote_open"
+    j = i + 1
+    paragraphs: list[list[Run]] = []
+    while j < len(tokens) and tokens[j].type != "blockquote_close":
+        if tokens[j].type != "paragraph_open":
+            raise ValueError(
+                f"Blockquotes are reserved for comments in this dialect and may "
+                f"only contain plain paragraphs starting with 'comment: <author>' "
+                f"— found {tokens[j].type!r} inside one."
+            )
+        node, j = _parse_paragraph(tokens, j)
+        if node.type != "p":
+            raise ValueError(
+                "Unsupported content in a comment blockquote (an image); "
+                "comments may only contain plain text paragraphs."
+            )
+        paragraphs.append(node.runs)
+    if j >= len(tokens):
+        raise ValueError("Unclosed blockquote — missing the blank line that ends it.")
+
+    if not paragraphs:
+        raise ValueError(
+            "Empty blockquote — comments must start with 'comment: <author>'."
+        )
+
+    header = "".join(r.text for r in paragraphs[0]).strip()
+    m = RE_COMMENT_HEADER.match(header)
+    if not m:
+        raise ValueError(
+            f"Blockquotes are reserved for comments in this dialect: the first "
+            f"line must read 'comment: <author>' — found {header!r}."
+        )
+    author = m.group(1).strip()
+    body = paragraphs[1:]
+    if not body:
+        raise ValueError(f"Comment by {author!r} has no body text.")
+
+    return author, body, j + 1  # step past blockquote_close
+
+
 def _parse_list_item(tokens: list, i: int, kind: str, depth: int) -> tuple[list[ContentNode], int]:
     """Parse list_item_open + content. Return (nodes, new_i).
 
@@ -390,6 +443,10 @@ def _structural_pass(tokens: list) -> list[ContentNode]:
             if node.tbl_headers and node.tbl_rows:
                 nodes.append(node)
 
+        elif t == "blockquote_open":
+            author, body, i = _parse_comment_blockquote(tokens, i)
+            nodes.append(ContentNode(type="_comment", comment_author=author, comment_body=body))
+
         else:
             i += 1
 
@@ -401,9 +458,13 @@ def _structural_pass(tokens: list) -> list[ContentNode]:
 # ---------------------------------------------------------------------------
 
 def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
-    """Detect and transform macro patterns: figures and tables.
+    """Detect and transform macro patterns: figures, tables, and comments.
 
-    Linear scan. State: pending figures/tables, current context ids.
+    Linear scan. State: pending figures/tables/comment, current context ids.
+    A `_comment` node (from a blockquote) attaches to whatever the *next*
+    node dispatch actually appends to `result` — which may be several input
+    nodes later if that next unit is itself a multi-paragraph figure/table
+    macro still being assembled.
     """
     result: list[ContentNode] = []
     pending_fig: dict[str, ContentNode] = {}
@@ -411,19 +472,20 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
     cur_fig: str | None = None
     cur_tab: str | None = None
 
-    for node in nodes:
+    def _dispatch(node: ContentNode) -> None:
+        nonlocal cur_fig, cur_tab
         t = node.type
 
         # --- Heading: reset figure context ---
         if t in ("h1", "h2", "h3", "h4"):
             cur_fig = None
             result.append(node)
-            continue
+            return
 
         # --- List items and display math: pass through ---
         if t in ("bullet", "numbered", "math_display"):
             result.append(node)
-            continue
+            return
 
         raw = (getattr(node, "_raw", "") or "").strip()
 
@@ -442,7 +504,7 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
                 fig_title=parse_inline(title), fig_width_hint=width,
             )
             cur_fig = fig_id
-            continue
+            return
 
         # --- Figure caption: *:fig{id}: Caption* ---
         if fm and raw.startswith("*") and not raw.startswith("**"):
@@ -453,7 +515,7 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
                 fig.fig_caption = parse_inline(caption)
                 result.append(fig)
             cur_fig = None
-            continue
+            return
 
         # --- Table label: **:tab{id}: Caption** ---
         tm = RE_TAB_MACRO.match(raw.strip("*").strip())
@@ -464,7 +526,7 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
                 type="table", tbl_id=tab_id, tbl_caption=parse_inline(caption),
             )
             cur_tab = tab_id
-            continue
+            return
 
         # --- Table caption: *:tab{id}: Caption* ---
         if tm and raw.startswith("*") and not raw.startswith("**"):
@@ -472,14 +534,14 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
             if tab_id in pending_tab:
                 result.append(pending_tab.pop(tab_id))
             cur_tab = None
-            continue
+            return
 
         # --- Image: attach to pending figure ---
         if t == "_image":
             if cur_fig and cur_fig in pending_fig:
                 pending_fig[cur_fig].fig_path = node.fig_path
                 pending_fig[cur_fig].fig_alt = node.fig_alt
-            continue
+            return
 
         # --- Mermaid: attach to pending figure ---
         if t == "_mermaid":
@@ -487,7 +549,7 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
                 fig = pending_fig[cur_fig]
                 fig.fig_path = f"_mermaid:{cur_fig}"
                 fig.mermaid_src = node.mermaid_src
-            continue
+            return
 
         # --- Table: attach to pending table ---
         if t == "table":
@@ -499,15 +561,50 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
                 cur_tab = None
             elif node.tbl_headers and node.tbl_rows:
                 result.append(node)
-            continue
+            return
 
         # --- Regular paragraph ---
         if t == "p":
             result.append(node)
 
+    pending_comment: ContentNode | None = None
+    for node in nodes:
+        if node.type == "_comment":
+            if pending_comment is not None:
+                raise ValueError(
+                    f"Two comments in a row with nothing between them (by "
+                    f"{pending_comment.comment_author!r} and "
+                    f"{node.comment_author!r}) — each comment must attach to "
+                    f"a following heading, paragraph, bullet, or numbered item."
+                )
+            pending_comment = node
+            continue
+
+        before = len(result)
+        _dispatch(node)
+
+        if pending_comment is not None and len(result) > before:
+            target = result[before]
+            if target.type not in _COMMENTABLE_TYPES or target.has_math:
+                raise ValueError(
+                    f"Comment by {pending_comment.comment_author!r} attaches "
+                    f"to a {target.type!r} node, which cannot carry a comment "
+                    f"(only headings, paragraphs, bullets, and numbered items "
+                    f"without inline math can)."
+                )
+            target.comment_author = pending_comment.comment_author
+            target.comment_body = pending_comment.comment_body
+            pending_comment = None
+
     # Flush unclosed pending
     result.extend(pending_fig.values())
     result.extend(pending_tab.values())
+
+    if pending_comment is not None:
+        raise ValueError(
+            f"Comment by {pending_comment.comment_author!r} has nothing "
+            f"after it to attach to."
+        )
 
     return result
 

@@ -318,14 +318,41 @@ def _build_content_proxies(
     tpl: DocxTemplate,
     image_base: Path,
     text_width: int,
-) -> tuple[list, dict[str, list[Run]]]:
+) -> tuple[list, dict[str, list[Run]], list[dict]]:
     """Build proxy list, assigning sequential math counters."""
     proxies = []
     inline_map: dict[str, list[Run]] = {}
+    comments: list[dict] = []
     math_disp_n = 0
     math_para_n = 0
     inline_n = 0
+    comment_n = 0
+
+    def _wrap_comment(node: ContentNode, runs: list[Run]) -> list[Run]:
+        nonlocal comment_n
+        if not node.comment_author:
+            return runs
+        comment_n += 1
+        comments.append({
+            'id': comment_n,
+            'author': node.comment_author,
+            'body': node.comment_body,
+        })
+        return (
+            [Run(text=f'@@COMMENTSTART:{comment_n}@@')]
+            + runs
+            + [Run(text=f'@@COMMENTEND:{comment_n}@@')]
+        )
+
     for node in content:
+        if node.comment_author and (
+            node.type in {'figure', 'table', 'math_display'} or node.has_math
+        ):
+            raise ValueError(
+                f"Comment by {node.comment_author!r} attached to an "
+                f"unsupported {node.type!r} node — this should have been "
+                f"rejected during parsing."
+            )
         if node.type == 'figure':
             proxies.append(FigureProxy(node, tpl, image_base, text_width))
         elif node.type == 'table':
@@ -342,16 +369,16 @@ def _build_content_proxies(
         elif node.type in {'h1', 'h2', 'h3', 'h4', 'p', 'numbered'}:
             inline_n += 1
             key = f'@@INLINEFMT:{inline_n}@@'
-            inline_map[key] = _runs_with_section_label(node)
+            inline_map[key] = _wrap_comment(node, _runs_with_section_label(node))
             proxies.append(HeadingProxy(node, text_placeholder=key))
         elif node.type == 'bullet':
             inline_n += 1
             key = f'@@INLINEFMT:{inline_n}@@'
-            inline_map[key] = _runs_with_section_label(node)
+            inline_map[key] = _wrap_comment(node, _runs_with_section_label(node))
             proxies.append(BulletProxy(node, text_placeholder=key))
         else:
             proxies.append(HeadingProxy(node))
-    return proxies, inline_map
+    return proxies, inline_map, comments
 
 
 def _post_process_inline_runs(docx_path: str, inline_map: dict[str, list[Run]]) -> None:
@@ -546,6 +573,166 @@ def _post_process_checkboxes(docx_path: str) -> None:
     if changed:
         doc.save(docx_path)
         print(f'Post-processed {changed} checkbox(es) in {docx_path}')
+
+
+def _comment_initials(author: str) -> str:
+    parts = author.split()
+    return ''.join(p[0].upper() for p in parts if p) or '?'
+
+
+def _post_process_comments(docx_path: str, comments: list[dict]) -> None:
+    """Convert @@COMMENTSTART:n@@ / @@COMMENTEND:n@@ sentinel runs (emitted
+    by _build_content_proxies, materialized by _post_process_inline_runs)
+    into a real Word (OOXML) comment: commentRangeStart/End and a
+    commentReference run in word/document.xml, plus the word/comments.xml
+    part and its content-type/relationship registrations.
+
+    Must run last: the package-level parts added below (comments.xml, the
+    content-type override, the relationship) are written via a raw zip
+    patch that a later doc.save() from another post-processing pass could
+    silently drop, since python-docx doesn't know those parts exist.
+    """
+    if not comments:
+        return
+
+    from docx import Document as DocxDoc
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    XML_SPACE = '{http://www.w3.org/XML/1998/namespace}space'
+
+    doc = DocxDoc(docx_path)
+    body = doc.element.body
+
+    def _find_run(sentinel: str):
+        for r in body.iter(qn('w:r')):
+            t = r.find(qn('w:t'))
+            if t is not None and (t.text or '') == sentinel:
+                return r
+        return None
+
+    placed = 0
+    for c in comments:
+        cid = c['id']
+        start_r = _find_run(f'@@COMMENTSTART:{cid}@@')
+        end_r = _find_run(f'@@COMMENTEND:{cid}@@')
+        if start_r is None or end_r is None:
+            continue  # defensive: should not happen if md_parser validated correctly
+
+        start_p = start_r.getparent()
+        rng_start = OxmlElement('w:commentRangeStart')
+        rng_start.set(qn('w:id'), str(cid))
+        start_p.insert(list(start_p).index(start_r), rng_start)
+        start_p.remove(start_r)
+
+        end_p = end_r.getparent()
+        rng_end = OxmlElement('w:commentRangeEnd')
+        rng_end.set(qn('w:id'), str(cid))
+        end_idx = list(end_p).index(end_r)
+        end_p.insert(end_idx, rng_end)
+        end_p.remove(end_r)
+
+        ref_run = OxmlElement('w:r')
+        r_pr = OxmlElement('w:rPr')
+        r_style = OxmlElement('w:rStyle')
+        r_style.set(qn('w:val'), 'CommentReference')
+        r_pr.append(r_style)
+        ref_run.append(r_pr)
+        ref_el = OxmlElement('w:commentReference')
+        ref_el.set(qn('w:id'), str(cid))
+        ref_run.append(ref_el)
+        end_p.insert(end_idx + 1, ref_run)
+
+        placed += 1
+
+    if not placed:
+        return
+
+    doc.save(docx_path)
+
+    # --- Package-level parts python-docx doesn't manage ---
+    import shutil
+    import zipfile
+
+    CT = 'http://schemas.openxmlformats.org/package/2006/content-types'
+    PR = 'http://schemas.openxmlformats.org/package/2006/relationships'
+    REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
+    rels_path = 'word/_rels/document.xml.rels'
+
+    with zipfile.ZipFile(docx_path, 'r') as zin:
+        names = set(zin.namelist())
+        ct_xml = zin.read('[Content_Types].xml')
+        rels_xml = zin.read(rels_path) if rels_path in names else None
+        others = {n: zin.read(n) for n in names
+                  if n not in ('[Content_Types].xml', rels_path)}
+
+    # word/comments.xml
+    comments_root = etree.Element(f'{{{_NS_W}}}comments', nsmap={'w': _NS_W})
+    for c in comments:
+        w_comment = etree.SubElement(comments_root, f'{{{_NS_W}}}comment')
+        w_comment.set(f'{{{_NS_W}}}id', str(c['id']))
+        w_comment.set(f'{{{_NS_W}}}author', c['author'])
+        w_comment.set(f'{{{_NS_W}}}initials', _comment_initials(c['author']))
+        w_comment.set(f'{{{_NS_W}}}date', '2026-01-01T00:00:00Z')
+        for para_runs in c['body']:
+            p_el = etree.SubElement(w_comment, f'{{{_NS_W}}}p')
+            for run in para_runs:
+                r_el = etree.SubElement(p_el, f'{{{_NS_W}}}r')
+                if run.bold or run.italic or run.code or run.color:
+                    r_pr = etree.SubElement(r_el, f'{{{_NS_W}}}rPr')
+                    if run.bold:
+                        etree.SubElement(r_pr, f'{{{_NS_W}}}b')
+                    if run.italic:
+                        etree.SubElement(r_pr, f'{{{_NS_W}}}i')
+                    if run.code:
+                        fonts_el = etree.SubElement(r_pr, f'{{{_NS_W}}}rFonts')
+                        fonts_el.set(f'{{{_NS_W}}}ascii', 'Courier New')
+                        fonts_el.set(f'{{{_NS_W}}}hAnsi', 'Courier New')
+                    if run.color:
+                        color_el = etree.SubElement(r_pr, f'{{{_NS_W}}}color')
+                        color_el.set(f'{{{_NS_W}}}val', run.color.lstrip('#'))
+                t_el = etree.SubElement(r_el, f'{{{_NS_W}}}t')
+                t_el.set(XML_SPACE, 'preserve')
+                t_el.text = run.text
+    comments_xml = etree.tostring(comments_root, xml_declaration=True, encoding='UTF-8', standalone=True)
+
+    # [Content_Types].xml — register comments.xml if not already present
+    ct_root = etree.fromstring(ct_xml)
+    if not any(el.get('PartName') == '/word/comments.xml'
+               for el in ct_root.findall(f'{{{CT}}}Override')):
+        override = etree.SubElement(ct_root, f'{{{CT}}}Override')
+        override.set('PartName', '/word/comments.xml')
+        override.set('ContentType',
+                     'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml')
+    new_ct_xml = etree.tostring(ct_root, xml_declaration=True, encoding='UTF-8', standalone=True)
+
+    # word/_rels/document.xml.rels — register the comments relationship
+    if rels_xml is not None:
+        rels_root = etree.fromstring(rels_xml)
+    else:
+        rels_root = etree.Element(f'{{{PR}}}Relationships', nsmap={None: PR})
+    if not any(el.get('Type') == REL_TYPE for el in rels_root.findall(f'{{{PR}}}Relationship')):
+        existing_ids = []
+        for el in rels_root.findall(f'{{{PR}}}Relationship'):
+            m = re.match(r'rId(\d+)$', el.get('Id') or '')
+            if m:
+                existing_ids.append(int(m.group(1)))
+        rel = etree.SubElement(rels_root, f'{{{PR}}}Relationship')
+        rel.set('Id', f'rId{(max(existing_ids) + 1) if existing_ids else 1}')
+        rel.set('Type', REL_TYPE)
+        rel.set('Target', 'comments.xml')
+    new_rels_xml = etree.tostring(rels_root, xml_declaration=True, encoding='UTF-8', standalone=True)
+
+    tmp_path = docx_path + '.tmp'
+    with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for name, data in others.items():
+            zout.writestr(name, data)
+        zout.writestr('[Content_Types].xml', new_ct_xml)
+        zout.writestr(rels_path, new_rels_xml)
+        zout.writestr('word/comments.xml', comments_xml)
+    shutil.move(tmp_path, docx_path)
+
+    print(f'Post-processed {placed} native Word comment(s) into {docx_path}')
 
 
 def _post_process_math(docx_path: str, content_proxies: list) -> None:
@@ -1441,7 +1628,7 @@ def render(
     figures_list, tables_list, fig_map, tab_map = finalize_content(content_nodes)
 
     # Build content proxy list (assigns math counters)
-    content_proxies, inline_map = _build_content_proxies(content_nodes, tpl, img_base, text_width)
+    content_proxies, inline_map, comments = _build_content_proxies(content_nodes, tpl, img_base, text_width)
 
     # Split proxies back into each VAR's own list, in the template's context
     offset = 0
@@ -1476,4 +1663,7 @@ def render(
     _post_process_image_wrapping(output_path)
     # Post-process: sync native w14:checkbox controls from @@CHK:x@@ sentinels
     _post_process_checkboxes(output_path)
+    # Post-process: convert @@COMMENTSTART/END:n@@ sentinels into native Word
+    # comments. Must run last (see _post_process_comments docstring).
+    _post_process_comments(output_path, comments)
     print(f'Rendered → {output_path}')
