@@ -247,7 +247,7 @@ def validate_docx_integrity(docx_path: str) -> dict:
 
     instr_texts = [el.text or "" for el in root.findall(".//w:instrText", xml_ns)]
     xref_fields = [t for t in instr_texts
-                   if "HYPERLINK" in t and "\\l" in t and "sec_" in t]
+                   if re.search(r'REF\s+"sec_', t)]
 
     return {
         "docx_sec_bookmark_count": len(sec_bookmarks),
