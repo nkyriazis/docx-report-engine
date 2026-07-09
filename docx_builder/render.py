@@ -377,8 +377,72 @@ def _build_content_proxies(
             inline_map[key] = _wrap_comment(node, _runs_with_section_label(node))
             proxies.append(BulletProxy(node, text_placeholder=key))
         else:
+            # Includes '_footnote_def' nodes: no template branch matches their
+            # type, so they render no body content — kept 1:1 so the per-VAR
+            # proxy split in render() stays aligned.
             proxies.append(HeadingProxy(node))
     return proxies, inline_map, comments
+
+
+# ---------------------------------------------------------------------------
+# Footnotes — registry construction and validation
+# ---------------------------------------------------------------------------
+
+def _collect_footnotes(content_nodes: list[ContentNode]) -> list[dict]:
+    """Build the footnote list ({key, runs} in first-reference order) from
+    '_footnote_def' nodes and @@FOOTREF:key@@ reference runs.
+
+    Raises on duplicate definitions, undefined references, and references in
+    unsupported places (figure titles/captions, table captions/cells).
+    Warns (stdout) about definitions that are never referenced.
+    """
+    defs: dict[str, list[Run]] = {}
+    for node in content_nodes:
+        if node.type != '_footnote_def':
+            continue
+        if node.footnote_key in defs:
+            raise ValueError(f"Footnote [^{node.footnote_key}] is defined more than once.")
+        defs[node.footnote_key] = node.runs
+
+    key_order: list[str] = []
+    for node in content_nodes:
+        if node.type == '_footnote_def':
+            continue
+        if node.type == 'figure':
+            if any(r.footnote_key for r in node.fig_title + node.fig_caption):
+                raise ValueError(
+                    f"Figure {node.fig_id!r} has a footnote reference in its "
+                    f"title/caption — footnotes are only supported in body "
+                    f"text (headings, paragraphs, list items)."
+                )
+            continue
+        if node.type == 'table':
+            if any(r.footnote_key for r in node.tbl_caption) or any(
+                '@@FOOTREF:' in cell
+                for row in [node.tbl_headers, *node.tbl_rows] for cell in row
+            ):
+                raise ValueError(
+                    f"Table {node.tbl_id!r} has a footnote reference in its "
+                    f"caption or cells — footnotes are only supported in body "
+                    f"text (headings, paragraphs, list items)."
+                )
+            continue
+        for run in node.runs:
+            if run.footnote_key and run.footnote_key not in key_order:
+                key_order.append(run.footnote_key)
+
+    missing = [k for k in key_order if k not in defs]
+    if missing:
+        raise ValueError(
+            "Footnote reference(s) without a definition: "
+            + ", ".join(f"[^{k}]" for k in missing)
+        )
+    unused = [k for k in defs if k not in key_order]
+    if unused:
+        print("Warning: footnote definition(s) never referenced: "
+              + ", ".join(f"[^{k}]" for k in unused))
+
+    return [{'key': k, 'runs': defs[k]} for k in key_order]
 
 
 def _post_process_inline_runs(docx_path: str, inline_map: dict[str, list[Run]]) -> None:
@@ -573,6 +637,221 @@ def _post_process_checkboxes(docx_path: str) -> None:
     if changed:
         doc.save(docx_path)
         print(f'Post-processed {changed} checkbox(es) in {docx_path}')
+
+
+def _runs_to_w_elements(parent, runs: list[Run], xml_space: str) -> None:
+    """Serialize Runs as <w:r> children of an lxml element (footnote/comment
+    bodies: plain formatted text only)."""
+    for run in runs:
+        r_el = etree.SubElement(parent, f'{{{_NS_W}}}r')
+        if run.bold or run.italic or run.code or run.color:
+            r_pr = etree.SubElement(r_el, f'{{{_NS_W}}}rPr')
+            if run.bold:
+                etree.SubElement(r_pr, f'{{{_NS_W}}}b')
+            if run.italic:
+                etree.SubElement(r_pr, f'{{{_NS_W}}}i')
+            if run.code:
+                fonts_el = etree.SubElement(r_pr, f'{{{_NS_W}}}rFonts')
+                fonts_el.set(f'{{{_NS_W}}}ascii', 'Courier New')
+                fonts_el.set(f'{{{_NS_W}}}hAnsi', 'Courier New')
+            if run.color:
+                color_el = etree.SubElement(r_pr, f'{{{_NS_W}}}color')
+                color_el.set(f'{{{_NS_W}}}val', run.color.lstrip('#'))
+        t_el = etree.SubElement(r_el, f'{{{_NS_W}}}t')
+        t_el.set(xml_space, 'preserve')
+        t_el.text = run.text
+
+
+def _post_process_footnotes(docx_path: str, footnotes: list[dict]) -> None:
+    """Convert @@FOOTREF:key@@ sentinel runs into native Word footnotes:
+    a FootnoteReference-styled w:footnoteReference run in document.xml plus
+    one w:footnote entry per key appended to word/footnotes.xml.
+
+    Word assigns the *displayed* numbers by reference order automatically —
+    w:id values only bind references to entries, so new entries are keyed
+    from max(existing id)+1 and coexist with any footnotes the template
+    already carries. If the template has no footnotes part at all, one is
+    created (with separator/continuation-separator entries) and registered
+    in [Content_Types].xml and document.xml.rels — same raw-zip approach as
+    _post_process_comments, and like it this must run after every pass that
+    calls doc.save() on a Document opened before the zip patch.
+    """
+    if not footnotes:
+        return
+
+    import shutil
+    import zipfile
+
+    from docx import Document as DocxDoc
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    XML_SPACE = '{http://www.w3.org/XML/1998/namespace}space'
+    RE_FOOTREF_SENT = re.compile(r'@@FOOTREF:([^@]+)@@')
+
+    # --- Read (or scaffold) the footnotes part to allocate ids ---
+    CT = 'http://schemas.openxmlformats.org/package/2006/content-types'
+    PR = 'http://schemas.openxmlformats.org/package/2006/relationships'
+    REL_TYPE = ('http://schemas.openxmlformats.org/officeDocument/2006/'
+                'relationships/footnotes')
+    FOOT_CT = ('application/vnd.openxmlformats-officedocument.'
+               'wordprocessingml.footnotes+xml')
+    rels_path = 'word/_rels/document.xml.rels'
+
+    with zipfile.ZipFile(docx_path, 'r') as zin:
+        names = set(zin.namelist())
+        foot_xml = zin.read('word/footnotes.xml') if 'word/footnotes.xml' in names else None
+
+    part_existed = foot_xml is not None
+    if part_existed:
+        foot_root = etree.fromstring(foot_xml)
+        existing_ids = []
+        for el in foot_root.findall(f'{{{_NS_W}}}footnote'):
+            try:
+                existing_ids.append(int(el.get(f'{{{_NS_W}}}id') or ''))
+            except ValueError:
+                pass
+        base_id = max(existing_ids + [0]) + 1
+    else:
+        foot_root = etree.Element(f'{{{_NS_W}}}footnotes', nsmap={'w': _NS_W})
+        for sep_id, sep_tag, sep_type in (
+            ('-1', 'separator', 'separator'),
+            ('0', 'continuationSeparator', 'continuationSeparator'),
+        ):
+            fn = etree.SubElement(foot_root, f'{{{_NS_W}}}footnote')
+            fn.set(f'{{{_NS_W}}}type', sep_type)
+            fn.set(f'{{{_NS_W}}}id', sep_id)
+            p_el = etree.SubElement(fn, f'{{{_NS_W}}}p')
+            r_el = etree.SubElement(p_el, f'{{{_NS_W}}}r')
+            etree.SubElement(r_el, f'{{{_NS_W}}}{sep_tag}')
+        base_id = 1
+
+    id_map = {f['key']: base_id + i for i, f in enumerate(footnotes)}
+
+    # --- Replace sentinel runs in document.xml with footnote references ---
+    doc = DocxDoc(docx_path)
+    body = doc.element.body
+    placed = 0
+    for p_el in body.iter(qn('w:p')):
+        for r_el in list(p_el.findall(qn('w:r'))):
+            text = ''.join(t.text or '' for t in r_el.findall(qn('w:t')))
+            if '@@FOOTREF:' not in text:
+                continue
+            new_els = []
+
+            def _plain_run(fragment: str):
+                run_el = copy.deepcopy(r_el)
+                for child in list(run_el):
+                    if child.tag != qn('w:rPr'):
+                        run_el.remove(child)
+                t_el = OxmlElement('w:t')
+                t_el.set(XML_SPACE, 'preserve')
+                t_el.text = fragment
+                run_el.append(t_el)
+                return run_el
+
+            pos = 0
+            for m in RE_FOOTREF_SENT.finditer(text):
+                if m.start() > pos:
+                    new_els.append(_plain_run(text[pos:m.start()]))
+                fid = id_map.get(m.group(1))
+                if fid is None:
+                    raise ValueError(
+                        f"Footnote reference [^{m.group(1)}] has no definition "
+                        f"(should have been caught by _collect_footnotes)."
+                    )
+                ref_run = OxmlElement('w:r')
+                r_pr = OxmlElement('w:rPr')
+                r_style = OxmlElement('w:rStyle')
+                r_style.set(qn('w:val'), 'FootnoteReference')
+                r_pr.append(r_style)
+                ref_run.append(r_pr)
+                ref_el = OxmlElement('w:footnoteReference')
+                ref_el.set(qn('w:id'), str(fid))
+                ref_run.append(ref_el)
+                new_els.append(ref_run)
+                placed += 1
+                pos = m.end()
+            if pos < len(text):
+                new_els.append(_plain_run(text[pos:]))
+
+            for el in new_els:
+                r_el.addprevious(el)
+            p_el.remove(r_el)
+
+    if not placed:
+        print('Warning: footnote definitions present but no @@FOOTREF@@ '
+              'sentinels found in the document body — footnotes not written.')
+        return
+
+    doc.save(docx_path)
+
+    # --- Append the footnote entries to the footnotes part ---
+    for f in footnotes:
+        fn = etree.SubElement(foot_root, f'{{{_NS_W}}}footnote')
+        fn.set(f'{{{_NS_W}}}id', str(id_map[f['key']]))
+        p_el = etree.SubElement(fn, f'{{{_NS_W}}}p')
+        p_pr = etree.SubElement(p_el, f'{{{_NS_W}}}pPr')
+        p_style = etree.SubElement(p_pr, f'{{{_NS_W}}}pStyle')
+        p_style.set(f'{{{_NS_W}}}val', 'FootnoteText')
+        ref_r = etree.SubElement(p_el, f'{{{_NS_W}}}r')
+        ref_rpr = etree.SubElement(ref_r, f'{{{_NS_W}}}rPr')
+        ref_rstyle = etree.SubElement(ref_rpr, f'{{{_NS_W}}}rStyle')
+        ref_rstyle.set(f'{{{_NS_W}}}val', 'FootnoteReference')
+        etree.SubElement(ref_r, f'{{{_NS_W}}}footnoteRef')
+        space_r = etree.SubElement(p_el, f'{{{_NS_W}}}r')
+        space_t = etree.SubElement(space_r, f'{{{_NS_W}}}t')
+        space_t.set(XML_SPACE, 'preserve')
+        space_t.text = ' '
+        _runs_to_w_elements(p_el, f['runs'], XML_SPACE)
+    new_foot_xml = etree.tostring(foot_root, xml_declaration=True,
+                                  encoding='UTF-8', standalone=True)
+
+    with zipfile.ZipFile(docx_path, 'r') as zin:
+        names = set(zin.namelist())
+        ct_xml = zin.read('[Content_Types].xml')
+        rels_xml = zin.read(rels_path) if rels_path in names else None
+        others = {n: zin.read(n) for n in names
+                  if n not in ('[Content_Types].xml', rels_path, 'word/footnotes.xml')}
+
+    ct_root = etree.fromstring(ct_xml)
+    if not any(el.get('PartName') == '/word/footnotes.xml'
+               for el in ct_root.findall(f'{{{CT}}}Override')):
+        override = etree.SubElement(ct_root, f'{{{CT}}}Override')
+        override.set('PartName', '/word/footnotes.xml')
+        override.set('ContentType', FOOT_CT)
+    new_ct_xml = etree.tostring(ct_root, xml_declaration=True,
+                                encoding='UTF-8', standalone=True)
+
+    if rels_xml is not None:
+        rels_root = etree.fromstring(rels_xml)
+    else:
+        rels_root = etree.Element(f'{{{PR}}}Relationships', nsmap={None: PR})
+    if not any(el.get('Type') == REL_TYPE
+               for el in rels_root.findall(f'{{{PR}}}Relationship')):
+        existing_rids = []
+        for el in rels_root.findall(f'{{{PR}}}Relationship'):
+            m = re.match(r'rId(\d+)$', el.get('Id') or '')
+            if m:
+                existing_rids.append(int(m.group(1)))
+        rel = etree.SubElement(rels_root, f'{{{PR}}}Relationship')
+        rel.set('Id', f'rId{(max(existing_rids) + 1) if existing_rids else 1}')
+        rel.set('Type', REL_TYPE)
+        rel.set('Target', 'footnotes.xml')
+    new_rels_xml = etree.tostring(rels_root, xml_declaration=True,
+                                  encoding='UTF-8', standalone=True)
+
+    tmp_path = docx_path + '.tmp'
+    with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for name, data in others.items():
+            zout.writestr(name, data)
+        zout.writestr('[Content_Types].xml', new_ct_xml)
+        zout.writestr(rels_path, new_rels_xml)
+        zout.writestr('word/footnotes.xml', new_foot_xml)
+    shutil.move(tmp_path, docx_path)
+
+    print(f'Post-processed {placed} footnote reference(s) '
+          f'({len(footnotes)} footnote(s)) into {docx_path}')
 
 
 def _comment_initials(author: str) -> str:
@@ -1309,10 +1588,12 @@ def _post_process_crossrefs(
             first_run.addnext(bm_end)
 
     # --- Phase 1c: Repair sentinels split across runs by pandoc math rendering ---
-    # Pandoc may split @@SECREF:id@@ / @@FIGREF:id@@ / @@TABREF:id@@ across
-    # adjacent w:r elements (e.g. @ | @FIGREF:id | @@). A paragraph can contain
-    # several such sentinels back-to-back, so keep repairing until none remain.
-    _RE_ANY_SENT = re.compile(r'@@(?:SECREF|FIGREF|TABREF):[^@]+@@')
+    # Pandoc may split @@SECREF:id@@ / @@FIGREF:id@@ / @@TABREF:id@@ /
+    # @@FOOTREF:key@@ across adjacent w:r elements (e.g. @ | @FIGREF:id | @@).
+    # A paragraph can contain several such sentinels back-to-back, so keep
+    # repairing until none remain. FOOTREF sentinels are repaired here and
+    # consumed later by _post_process_footnotes.
+    _RE_ANY_SENT = re.compile(r'@@(?:SECREF|FIGREF|TABREF|FOOTREF):[^@]+@@')
     for para in all_paras:
         p = para._p
         while True:
@@ -1627,6 +1908,9 @@ def render(
     # Finalize: assign sequential figure/table numbers, build maps
     figures_list, tables_list, fig_map, tab_map = finalize_content(content_nodes)
 
+    # Footnotes: registry in first-reference order (validates defs/refs)
+    footnotes = _collect_footnotes(content_nodes)
+
     # Build content proxy list (assigns math counters)
     content_proxies, inline_map, comments = _build_content_proxies(content_nodes, tpl, img_base, text_width)
 
@@ -1663,6 +1947,9 @@ def render(
     _post_process_image_wrapping(output_path)
     # Post-process: sync native w14:checkbox controls from @@CHK:x@@ sentinels
     _post_process_checkboxes(output_path)
+    # Post-process: convert @@FOOTREF:key@@ sentinels into native Word
+    # footnotes (footnotes.xml entries + footnoteReference runs).
+    _post_process_footnotes(output_path, footnotes)
     # Post-process: convert @@COMMENTSTART/END:n@@ sentinels into native Word
     # comments. Must run last (see _post_process_comments docstring).
     _post_process_comments(output_path, comments)

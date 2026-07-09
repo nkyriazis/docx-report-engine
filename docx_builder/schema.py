@@ -14,6 +14,7 @@ class Run:
     ref_id: str = ''  # non-empty → section cross-reference; text holds @@SECREF:id@@ sentinel
     fig_ref_id: str = ''  # non-empty → figure cross-reference; text holds @@FIGREF:id@@ sentinel
     tab_ref_id: str = ''  # non-empty → table cross-reference; text holds @@TABREF:id@@ sentinel
+    footnote_key: str = ''  # non-empty → footnote reference; text holds @@FOOTREF:key@@ sentinel
 
 
 @dataclass
@@ -28,6 +29,8 @@ class ContentNode:
       'figure'              — figure (image + caption)
       'table'               — data table
       'math_display'        — display equation ($$...$$)
+      '_footnote_def'       — footnote definition ([^key]: body); carries
+                              footnote_key + runs, renders no body content
     """
     type: str
 
@@ -60,6 +63,9 @@ class ContentNode:
     # Section cross-reference fields (headings only)
     sec_id: str = ''            # optional {#id} label from heading syntax
     sec_number: str = ''        # numeric prefix captured before stripping (e.g. '1.1')
+
+    # Footnote definition key ('_footnote_def' nodes only; body in `runs`)
+    footnote_key: str = ''
 
     # Comment fields — set when a strict `> comment: Author` blockquote
     # immediately precedes this node in the draft. Renders as a native Word

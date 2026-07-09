@@ -224,12 +224,41 @@ opening the rendered DOCX.
 
 The engine needs no template cooperation for this feature.
 
-## 7. The markdown dialect (source side, for reference)
+## 7. Footnotes
+
+Standard markdown footnote syntax: `[^key]` in body text references a
+`[^key]: body text` definition paragraph (anywhere in any freeform VAR —
+footnotes are global to the document, conventionally collected at the end
+of the VAR that uses them). Definitions may hard-wrap; continuation lines
+are joined until a blank line, another definition, a heading, or a fence.
+Bodies are plain formatted text (bold/italic/code/color); cross-references,
+nested footnotes, figures, and math are rejected at parse time.
+
+References render as native Word footnotes: a `FootnoteReference`-styled
+`w:footnoteReference` run at the marker, and a `FootnoteText`-styled entry
+in `word/footnotes.xml` (created and registered if the template has none;
+appended after any existing entries otherwise — Word numbers displayed
+references automatically, so template-carried footnotes coexist). `[^key]`
+markers are allowed in headings, paragraphs, bullets, and numbered items —
+not figure titles/captions or table captions/cells. Referencing the same
+key twice yields two references to one shared footnote.
+
+Validation is strict, matching comments (§6): duplicate definitions and
+references without a definition fail the build; definitions never
+referenced only warn. `build_report.json` reports `footnotes_defined` /
+`footnotes_referenced` metrics. Word's *displayed* numbering follows
+reference order in the document — the draft's key names carry no ordering
+meaning. The engine needs no template cooperation, though templates with
+`FootnoteReference`/`FootnoteText` styles (any Frontex-derived template
+has them) render prettier footnotes.
+
+## 8. The markdown dialect (source side, for reference)
 
 `:KEY:` acronyms (expanded on first use), `:fig{id}:` / `:tab{id}:` /
 `:ref{id}:` cross-references, `{#label}` heading anchors,
 `**:fig{id}: Title** [width]` + image/mermaid + `*:fig{id}: caption*` figure
 groups, `**:tab{id}: Caption**` + GFM table groups, `$...$` / `$$...$$`
-math, ` ```mermaid ` fences, `> comment: Author` blockquotes (§6). All
-degrade gracefully in a plain markdown preview — that property is a design
-goal; keep it when extending the dialect.
+math, ` ```mermaid ` fences, `> comment: Author` blockquotes (§6),
+`[^key]` / `[^key]: body` footnotes (§7). All degrade gracefully in a
+plain markdown preview — that property is a design goal; keep it when
+extending the dialect.

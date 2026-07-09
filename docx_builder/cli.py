@@ -572,6 +572,40 @@ def build(
             print(f"   {len(comment_assignments)} comment(s) attached — "
                   f"review build_report.json metrics.comment_assignments")
 
+        # -- Footnotes: validate definitions/references across all body VARs -
+        # (footnotes are global to the document: a [^key] used in one VAR may
+        # be defined in another; render() re-checks, but failing here gives a
+        # line in build_report.json instead of a traceback.)
+        all_nodes = [n for name in body_vars for n in context[name]]
+        def_keys = [n.footnote_key for n in all_nodes if n.type == "_footnote_def"]
+        dup_defs = sorted({k for k in def_keys if def_keys.count(k) > 1})
+        if dup_defs:
+            msg = "Duplicate footnote definitions: " + ", ".join(
+                f"[^{k}]" for k in dup_defs)
+            report_obj.error(msg)
+            raise RuntimeError(msg)
+        used_keys: list[str] = []
+        for n in all_nodes:
+            if n.type == "_footnote_def":
+                continue
+            for r in n.runs:
+                if r.footnote_key and r.footnote_key not in used_keys:
+                    used_keys.append(r.footnote_key)
+        missing = [k for k in used_keys if k not in def_keys]
+        if missing:
+            msg = "Footnote reference(s) without a definition: " + ", ".join(
+                f"[^{k}]" for k in missing)
+            report_obj.error(msg)
+            raise RuntimeError(msg)
+        for k in def_keys:
+            if k not in used_keys:
+                report_obj.warn(f"Footnote [^{k}] defined but never referenced")
+        report_obj.add_metric("footnotes_defined", len(def_keys))
+        report_obj.add_metric("footnotes_referenced", len(used_keys))
+        if def_keys:
+            print(f"   {len(def_keys)} footnote(s) defined, "
+                  f"{len(used_keys)} referenced")
+
         # -- Figure expansion ------------------------------------------------
         print("2. Figure expansion")
         report_obj.start_step("figure_expansion")

@@ -39,6 +39,7 @@ _RE_INLINE_FEATURE = re.compile(
     r'|(?P<tabref>:tab\{(?P<tabid>[^}]+)\}:)'
     r'|(?P<span_open><span\s+style="[^"]*color:\s*(?P<color>[^;"]+)[^"]*"[^>]*>)'
     r'|(?P<span_close></span>)'
+    r'|(?P<footref>@@FOOTREF:(?P<footkey>[^@]+)@@)'
 )
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,14 @@ RE_TAB_MACRO = re.compile(r'^:tab\{([^}]+)\}:\s*(.*?)$')
 RE_WIDTH_HINT = re.compile(r'^(\d+(?:\.\d+)?)(%|cm)$')
 RE_HEADING_ID = re.compile(r'\s*\{#([^}]+)\}\s*$')
 RE_COMMENT_HEADER = re.compile(r'^comment:\s*(\S.*)$')
+
+# Footnotes — `[^key]` inline references and `[^key]: body` definition
+# paragraphs. Definitions are extracted from the raw lines before the
+# markdown-it pass (a bare-URL body would otherwise be swallowed as a link
+# reference definition); references are converted to @@FOOTREF:key@@
+# sentinels at the same time so bracket-parsing can't split them.
+RE_FOOTNOTE_DEF = re.compile(r'^\[\^([A-Za-z0-9_.:+\-]+)\]:\s+(\S.*)$')
+RE_FOOTNOTE_REF = re.compile(r'\[\^([A-Za-z0-9_.:+\-]+)\]')
 
 # Node types a blockquote comment is allowed to attach to — plain-text nodes
 # whose rendering goes through the @@INLINEFMT:n@@ placeholder path. Math
@@ -109,6 +118,9 @@ def _emit_text(text: str, state: _InlineState, runs: list[Run]) -> None:
         elif m.group('tabref'):
             tid = m.group('tabid')
             runs.append(state.make_run(f'@@TABREF:{tid}@@', tab_ref_id=tid))
+        elif m.group('footref'):
+            fkey = m.group('footkey')
+            runs.append(state.make_run(m.group(0), footnote_key=fkey))
         elif m.group('span_open'):
             state.colors.append(m.group('color').strip())
         elif m.group('span_close'):
@@ -127,8 +139,8 @@ def _merge_adjacent(runs: list[Run]) -> list[Run]:
         prev = merged[-1] if merged else None
         if (
             prev is not None
-            and not (prev.ref_id or prev.fig_ref_id or prev.tab_ref_id)
-            and not (run.ref_id or run.fig_ref_id or run.tab_ref_id)
+            and not (prev.ref_id or prev.fig_ref_id or prev.tab_ref_id or prev.footnote_key)
+            and not (run.ref_id or run.fig_ref_id or run.tab_ref_id or run.footnote_key)
             and (prev.bold, prev.italic, prev.code, prev.color)
             == (run.bold, run.italic, run.code, run.color)
         ):
@@ -610,14 +622,83 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
 
 
 # ---------------------------------------------------------------------------
+# Footnote pre-pass — runs on raw lines, before markdown-it
+# ---------------------------------------------------------------------------
+
+def _extract_footnotes(lines: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split footnote definitions out of the body lines and convert inline
+    references to @@FOOTREF:key@@ sentinels.
+
+    A definition is a line reading `[^key]: body`; following non-blank lines
+    that are not themselves definitions, headings, or fences continue the
+    body (joined with spaces). Fenced code blocks pass through untouched.
+    Returns (body_lines, [(key, body_text), ...] in appearance order).
+    """
+    body: list[str] = []
+    defs: list[tuple[str, str]] = []
+    in_fence = False
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith('```') or stripped.startswith('~~~'):
+            in_fence = not in_fence
+            body.append(line)
+            i += 1
+            continue
+        if in_fence:
+            body.append(line)
+            i += 1
+            continue
+        m = RE_FOOTNOTE_DEF.match(line)
+        if m:
+            key, text = m.group(1), m.group(2).strip()
+            i += 1
+            while i < n:
+                cont = lines[i].strip()
+                if (not cont or RE_FOOTNOTE_DEF.match(lines[i])
+                        or cont.startswith(('#', '```', '~~~'))):
+                    break
+                text += ' ' + cont
+                i += 1
+            defs.append((key, text))
+            continue
+        body.append(RE_FOOTNOTE_REF.sub(lambda m: f'@@FOOTREF:{m.group(1)}@@', line))
+        i += 1
+    return body, defs
+
+
+def _footnote_def_node(key: str, text: str) -> ContentNode:
+    """Build a `_footnote_def` node, rejecting content a footnote can't hold."""
+    runs = parse_inline(text)
+    for run in runs:
+        if run.ref_id or run.fig_ref_id or run.tab_ref_id:
+            raise ValueError(
+                f"Footnote [^{key}] contains a cross-reference "
+                f"(:ref/:fig/:tab) — footnote bodies support only plain "
+                f"formatted text."
+            )
+        if run.footnote_key:
+            raise ValueError(
+                f"Footnote [^{key}] references another footnote — nested "
+                f"footnotes are not supported."
+            )
+    return ContentNode(type='_footnote_def', footnote_key=key, runs=runs)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def _parse_body(lines: list[str], content: list[ContentNode]) -> None:
     """Parse body lines into ContentNode list via markdown-it-py AST."""
+    lines, footnote_defs = _extract_footnotes(lines)
     tokens = _mdit.parse("\n".join(lines))
     structural = _structural_pass(tokens)
     content.extend(_process_macros(structural))
+    for key, text in footnote_defs:
+        content.append(_footnote_def_node(key, text))
 
 
 def parse_body(lines: list[str]) -> list[ContentNode]:
