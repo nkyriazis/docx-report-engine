@@ -266,6 +266,25 @@ _VAR_OPEN  = re.compile(r"^<!--\s*VAR:(\S+)\s+TYPE:(\S+)(?:\s+COLUMNS:([\w,]+))?
 _VAR_CLOSE = re.compile(r"^<!--\s*ENDVAR\s*-->$")
 
 
+def strip_authoring_comments(text: str) -> str:
+    """Drop HTML authoring comments (``<!-- ... -->``) so they never reach the
+    rendered DOCX — inline, block-level, or multi-line alike.
+
+    Comments are notes to ourselves, not content: left in place they leak into
+    the output (an inline one lands in a run; a block one inside a TYPE:table
+    VAR becomes a stray row). Two comments are spared — the ``VAR:``/``ENDVAR``
+    sentinels, which this dialect merely spells as HTML comments. Each removed
+    span leaves its own newlines behind, so downstream line numbers (preflight
+    errors, acronym warnings) still point at the author's file.
+    """
+    def _drop(m):
+        span = m.group(0)
+        if _VAR_OPEN.match(span) or _VAR_CLOSE.match(span):
+            return span
+        return "\n" * span.count("\n")
+    return re.sub(r"<!--.*?-->", _drop, text, flags=re.S)
+
+
 def _extract_vars(lines: list[str]) -> dict:
     """Extract VAR blocks from draft lines.
 
@@ -450,7 +469,7 @@ def build(
     try:
         # -- Preflight -------------------------------------------------------
         report_obj.start_step("preflight")
-        draft_text = Path(draft).read_text(encoding="utf-8")
+        draft_text = strip_authoring_comments(Path(draft).read_text(encoding="utf-8"))
         preflight = preflight_check(draft_text)
         report_obj.add_metric("draft_label_count", preflight["label_count"])
         report_obj.add_metric("draft_unique_label_count",
