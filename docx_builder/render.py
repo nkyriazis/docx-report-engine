@@ -726,12 +726,20 @@ def _post_process_footnotes(docx_path: str, footnotes: list[dict]) -> None:
             etree.SubElement(r_el, f'{{{_NS_W}}}{sep_tag}')
         base_id = 1
 
-    id_map = {f['key']: base_id + i for i, f in enumerate(footnotes)}
+    runs_by_key = {f['key']: f['runs'] for f in footnotes}
 
     # --- Replace sentinel runs in document.xml with footnote references ---
+    # Word's model is one footnote entry per reference: a single entry
+    # referenced from two places is malformed and triggers "Word found a
+    # problem... we repaired it", after which the renumber drops a number.
+    # So every @@FOOTREF@@ occurrence gets its own id and its own entry, even
+    # when several share a key (the citation text is simply duplicated) — the
+    # same thing Word does when you insert the same footnote twice by hand.
     doc = DocxDoc(docx_path)
     body = doc.element.body
     placed = 0
+    next_id = base_id
+    placements = []  # (id, key) in document order — one per reference
     for p_el in body.iter(qn('w:p')):
         for r_el in list(p_el.findall(qn('w:r'))):
             text = ''.join(t.text or '' for t in r_el.findall(qn('w:t')))
@@ -754,12 +762,15 @@ def _post_process_footnotes(docx_path: str, footnotes: list[dict]) -> None:
             for m in RE_FOOTREF_SENT.finditer(text):
                 if m.start() > pos:
                     new_els.append(_plain_run(text[pos:m.start()]))
-                fid = id_map.get(m.group(1))
-                if fid is None:
+                key = m.group(1)
+                if key not in runs_by_key:
                     raise ValueError(
-                        f"Footnote reference [^{m.group(1)}] has no definition "
+                        f"Footnote reference [^{key}] has no definition "
                         f"(should have been caught by _collect_footnotes)."
                     )
+                fid = next_id
+                next_id += 1
+                placements.append((fid, key))
                 ref_run = OxmlElement('w:r')
                 r_pr = OxmlElement('w:rPr')
                 r_style = OxmlElement('w:rStyle')
@@ -784,12 +795,20 @@ def _post_process_footnotes(docx_path: str, footnotes: list[dict]) -> None:
               'sentinels found in the document body — footnotes not written.')
         return
 
+    # Every footnote id actually referenced in the body — both the references
+    # we just placed and any the template already carried.
+    referenced_ids = {
+        ref.get(qn('w:id'))
+        for ref in body.iter(qn('w:footnoteReference'))
+        if ref.get(qn('w:id')) is not None
+    }
+
     doc.save(docx_path)
 
     # --- Append the footnote entries to the footnotes part ---
-    for f in footnotes:
+    for fid, key in placements:
         fn = etree.SubElement(foot_root, f'{{{_NS_W}}}footnote')
-        fn.set(f'{{{_NS_W}}}id', str(id_map[f['key']]))
+        fn.set(f'{{{_NS_W}}}id', str(fid))
         p_el = etree.SubElement(fn, f'{{{_NS_W}}}p')
         p_pr = etree.SubElement(p_el, f'{{{_NS_W}}}pPr')
         p_style = etree.SubElement(p_pr, f'{{{_NS_W}}}pStyle')
@@ -803,7 +822,19 @@ def _post_process_footnotes(docx_path: str, footnotes: list[dict]) -> None:
         space_t = etree.SubElement(space_r, f'{{{_NS_W}}}t')
         space_t.set(XML_SPACE, 'preserve')
         space_t.text = ' '
-        _runs_to_w_elements(p_el, f['runs'], XML_SPACE)
+        _runs_to_w_elements(p_el, runs_by_key[key], XML_SPACE)
+
+    # Drop orphan footnote entries the template shipped as authoring examples:
+    # a real note (no w:type) that nothing in the body references. Left in
+    # place, renderers surface it — Word/LibreOffice number it and shift every
+    # citation by one; OnlyOffice overlaps it into the body text. Structural
+    # entries (separator/continuationSeparator/continuationNotice, all typed)
+    # and our own just-appended notes are all kept.
+    for fn in list(foot_root.findall(f'{{{_NS_W}}}footnote')):
+        if (fn.get(f'{{{_NS_W}}}type') is None
+                and fn.get(f'{{{_NS_W}}}id') not in referenced_ids):
+            foot_root.remove(fn)
+
     new_foot_xml = etree.tostring(foot_root, xml_declaration=True,
                                   encoding='UTF-8', standalone=True)
 
@@ -851,7 +882,8 @@ def _post_process_footnotes(docx_path: str, footnotes: list[dict]) -> None:
     shutil.move(tmp_path, docx_path)
 
     print(f'Post-processed {placed} footnote reference(s) '
-          f'({len(footnotes)} footnote(s)) into {docx_path}')
+          f'({len(placements)} footnote entries from {len(runs_by_key)} '
+          f'unique definition(s)) into {docx_path}')
 
 
 def _comment_initials(author: str) -> str:
