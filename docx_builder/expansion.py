@@ -95,14 +95,23 @@ def _load_universals(path: str = _UNIVERSALS_PATH) -> frozenset[str]:
     return frozenset(defs.keys())
 
 
-def check_plain_acronyms(text: str, universals: frozenset[str] | None = None) -> dict[str, list[int]]:
-    """Return {word: [line_numbers]} for bare uppercase sequences (2+ chars)
-    in the main body that should be wrapped as :KEY: macros instead.
+def check_plain_acronyms(
+    text: str, universals: frozenset[str] | None = None
+) -> dict[str, list[tuple[int, bool]]]:
+    """Return {word: [(line_number, in_comment), ...]} for bare uppercase
+    sequences (2+ chars) in the main body that should be wrapped as :KEY:
+    macros instead.
 
     Skips front matter, code/mermaid blocks, already-wrapped :TOKEN: patterns,
     mermaid diagram labels (:fig{...}:), section refs (:ref{...}:), table refs
     (:tab{...}:), inline code spans, and cross-reference labels ({#...}).
     Terms in *universals* are also skipped (well-known, no definition needed).
+
+    Each occurrence is tagged with whether its line falls inside a
+    `> comment: <author>` blockquote. This dialect reserves blockquotes
+    exclusively for author comments (rendered as Word margin comments, not
+    body prose), so any line that starts with `>` after stripping is comment
+    text — a plain `>.startswith` check is sufficient and exact.
     """
     if universals is None:
         universals = _load_universals()
@@ -116,11 +125,12 @@ def check_plain_acronyms(text: str, universals: frozenset[str] | None = None) ->
             break
 
     in_code_block = False
-    results: dict[str, list[int]] = {}
+    results: dict[str, list[tuple[int, bool]]] = {}
 
     for ln in range(body_start, len(lines)):
         line = lines[ln]
         stripped = line.strip()
+        in_comment = stripped.startswith(">")
 
         # Track code / mermaid fences
         if stripped.startswith("```"):
@@ -157,7 +167,7 @@ def check_plain_acronyms(text: str, universals: frozenset[str] | None = None) ->
             ctx_before = cleaned[max(0, m.start() - 2) : m.start()]
             if re.match(r'[DT]\d$', ctx_before):
                 continue
-            results.setdefault(word, []).append(ln + 1)
+            results.setdefault(word, []).append((ln + 1, in_comment))
 
     return results
 

@@ -504,13 +504,21 @@ def build(
         plain_acronyms = check_plain_acronyms(draft_text)
         if plain_acronyms:
             for word in sorted(plain_acronyms):
-                lines = plain_acronyms[word]
+                occurrences = plain_acronyms[word]
                 in_defs = " [DEFINED]" if word in acronyms_defs else ""
-                sample = ", ".join(str(x) for x in lines[:5])
-                extra = f" ... +{len(lines)-5} more" if len(lines) > 5 else ""
+                n_total = len(occurrences)
+                n_comment = sum(1 for _, in_comment in occurrences if in_comment)
+                if n_comment == n_total:
+                    where = " [in comments only]"
+                elif n_comment > 0:
+                    where = f" [{n_comment}/{n_total} in comments]"
+                else:
+                    where = ""
+                sample = ", ".join(str(ln) for ln, _ in occurrences[:5])
+                extra = f" ... +{n_total-5} more" if n_total > 5 else ""
                 report_obj.warn(
                     f"Bare acronym '{word}' at lines {sample}{extra}"
-                    f"{in_defs} — use :{word}:"
+                    f"{in_defs}{where} — use :{word}:"
                 )
         report_obj.add_metric("draft_plain_acronyms", len(plain_acronyms))
         report_obj.add_metric("draft_acronyms_defined", len(acronyms_defs))
