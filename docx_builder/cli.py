@@ -41,6 +41,7 @@ from .expansion import (
     check_figures as _check_figures,
     RE_FIG_CAPTION,
 )
+from .anchors import expand_counts, expand_series_labels, run_checks, verify_features
 from .mermaid_render import render_mermaid_figures
 from .md_parser import parse_body
 from .render import render as render_jinja
@@ -469,7 +470,8 @@ def build(
     try:
         # -- Preflight -------------------------------------------------------
         report_obj.start_step("preflight")
-        draft_text = strip_authoring_comments(Path(draft).read_text(encoding="utf-8"))
+        raw_draft = Path(draft).read_text(encoding="utf-8")
+        draft_text = strip_authoring_comments(raw_draft)
         preflight = preflight_check(draft_text)
         report_obj.add_metric("draft_label_count", preflight["label_count"])
         report_obj.add_metric("draft_unique_label_count",
@@ -545,6 +547,32 @@ def build(
             report_obj.error(msg)
             raise RuntimeError(msg)
 
+        # Anchor feature help must stay in step with the macros it documents.
+        stale_help = verify_features()
+        if stale_help:
+            report_obj.warn(
+                "Anchor feature help is stale (run `features --verify`): "
+                + "; ".join(stale_help)
+            )
+
+        # Anchored-number checks (@check / @warn directives). Evaluated on the
+        # raw draft so the directives — which live in HTML comments — survive.
+        anchor_checks = run_checks(raw_draft)
+        report_obj.add_metric("anchor_checks", len(anchor_checks))
+        failed_checks = [c for c in anchor_checks if not c["ok"]]
+        report_obj.add_metric("anchor_checks_failed", len(failed_checks))
+        for c in failed_checks:
+            if c["severity"] == "warn":
+                report_obj.warn(f"Anchor check (@warn): {c['detail']}")
+            else:
+                report_obj.error(f"Anchor check (@check): {c['detail']}")
+        hard_failures = [c for c in failed_checks if c["severity"] == "check"]
+        if hard_failures:
+            raise RuntimeError(
+                f"{len(hard_failures)} anchor @check assertion(s) failed: "
+                + "; ".join(c["detail"] for c in hard_failures)
+            )
+
         report_obj.end_step("preflight", details={
             "label_count": preflight["label_count"],
             "ref_count": preflight["ref_count"],
@@ -558,6 +586,20 @@ def build(
         report_obj.start_step("acronym_expansion")
         text, used_acronyms = expand_acronyms(draft_text, acronyms_defs)
         report_obj.end_step("acronym_expansion")
+
+        # -- Anchored-count expansion ----------------------------------------
+        # Resolve :count{tab:ID}: emit macros here, before parse_body builds
+        # the DOCX context and before the compiled MD is written, so both
+        # downstream branches see the same plain number.
+        report_obj.start_step("count_expansion")
+        text, count_errors = expand_counts(text)
+        text, label_errors = expand_series_labels(text)
+        anchor_errs = count_errors + label_errors
+        if anchor_errs:
+            msg = f"Anchored-number errors: {'; '.join(anchor_errs)}"
+            report_obj.error(msg)
+            raise RuntimeError(msg)
+        report_obj.end_step("count_expansion")
 
         # -- Parse VAR blocks → context variables ----------------------------
         blocks = _extract_vars(text.splitlines())
@@ -703,9 +745,9 @@ def build(
 
     except Exception as exc:
         report_obj.error(str(exc))
-        for step in ["preflight", "acronym_expansion", "figure_expansion",
-                      "mermaid_rendering", "write_compiled_markdown",
-                      "docx_build", "docx_validation"]:
+        for step in ["preflight", "acronym_expansion", "count_expansion",
+                      "figure_expansion", "mermaid_rendering",
+                      "write_compiled_markdown", "docx_build", "docx_validation"]:
             report_obj.end_step(step, status="failed")
         report_obj.finalize(False)
         report_obj.write(report)

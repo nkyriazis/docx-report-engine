@@ -145,7 +145,7 @@ def check_plain_acronyms(
 
         # Remove already-wrapped :TOKEN: macros (including :fig{...}: / :ref{...}: / :tab{...}:)
         cleaned = RE_ACRONYM.sub("", line)
-        cleaned = re.sub(r":(fig|ref|tab)\{[^}]*\}:?", "", cleaned)
+        cleaned = re.sub(r":(fig|ref|tab|count|label|id)\{[^}]*\}:?", "", cleaned)
         # Remove HTML comments
         cleaned = re.sub(r"<!--.*?-->", "", cleaned)
         # Remove inline code spans (backtick-protected content)

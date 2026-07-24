@@ -3,6 +3,7 @@ import clize
 
 from .cli import build, load_prep_module
 from .split_assemble import split, assemble
+from .anchors import features
 
 def instrument_template(
     *,
@@ -18,4 +19,5 @@ clize.run({
     "split": split,
     "assemble": assemble,
     "instrument-template": instrument_template,
+    "features": features,
 })
