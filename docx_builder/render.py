@@ -125,11 +125,15 @@ class HeadingProxy:
         node: ContentNode,
         math_counter: int = 0,
         text_placeholder: str | None = None,
+        comment_id: int = 0,
     ) -> None:
         self._node = node
         self.type = node.type
         self._math_counter = math_counter
         self._text_placeholder = text_placeholder
+        # Non-zero only for a math paragraph carrying a native Word comment;
+        # _post_process_math() brackets the OMML paragraph with this id.
+        self.comment_id = comment_id
 
     @property
     def text(self) -> str:
@@ -328,26 +332,37 @@ def _build_content_proxies(
     inline_n = 0
     comment_n = 0
 
-    def _wrap_comment(node: ContentNode, runs: list[Run]) -> list[Run]:
+    def _register_comment(node: ContentNode, preplaced: bool = False) -> int:
+        """Append node's comment to the comments list; return its id (0 if none).
+
+        `preplaced=True` marks a comment whose range markers are inserted
+        directly by a later pass (math paragraphs, see _post_process_math),
+        rather than via @@COMMENTSTART/END@@ sentinel runs.
+        """
         nonlocal comment_n
         if not node.comment_author:
-            return runs
+            return 0
         comment_n += 1
         comments.append({
             'id': comment_n,
             'author': node.comment_author,
             'body': node.comment_body,
+            'preplaced': preplaced,
         })
+        return comment_n
+
+    def _wrap_comment(node: ContentNode, runs: list[Run]) -> list[Run]:
+        cid = _register_comment(node)
+        if not cid:
+            return runs
         return (
-            [Run(text=f'@@COMMENTSTART:{comment_n}@@')]
+            [Run(text=f'@@COMMENTSTART:{cid}@@')]
             + runs
-            + [Run(text=f'@@COMMENTEND:{comment_n}@@')]
+            + [Run(text=f'@@COMMENTEND:{cid}@@')]
         )
 
     for node in content:
-        if node.comment_author and (
-            node.type in {'figure', 'table', 'math_display'} or node.has_math
-        ):
+        if node.comment_author and node.type in {'figure', 'table', 'math_display'}:
             raise ValueError(
                 f"Comment by {node.comment_author!r} attached to an "
                 f"unsupported {node.type!r} node — this should have been "
@@ -362,10 +377,14 @@ def _build_content_proxies(
             proxies.append(MathDisplayProxy(node, math_disp_n))
         elif node.type == 'bullet' and node.has_math:
             math_para_n += 1
-            proxies.append(BulletProxy(node, math_para_n))
+            proxies.append(BulletProxy(
+                node, math_para_n,
+                comment_id=_register_comment(node, preplaced=True)))
         elif node.type in {'p', 'numbered'} and node.has_math:
             math_para_n += 1
-            proxies.append(HeadingProxy(node, math_counter=math_para_n))
+            proxies.append(HeadingProxy(
+                node, math_counter=math_para_n,
+                comment_id=_register_comment(node, preplaced=True)))
         elif node.type in {'h1', 'h2', 'h3', 'h4', 'p', 'numbered'}:
             inline_n += 1
             key = f'@@INLINEFMT:{inline_n}@@'
@@ -925,6 +944,11 @@ def _post_process_comments(docx_path: str, comments: list[dict]) -> None:
     placed = 0
     for c in comments:
         cid = c['id']
+        if c.get('preplaced'):
+            # Range markers already inserted by _post_process_math(); only the
+            # comments.xml part and package wiring below remain to be written.
+            placed += 1
+            continue
         start_r = _find_run(f'@@COMMENTSTART:{cid}@@')
         end_r = _find_run(f'@@COMMENTEND:{cid}@@')
         if start_r is None or end_r is None:
@@ -1050,15 +1074,16 @@ def _post_process_math(docx_path: str, content_proxies: list) -> None:
     """Replace MATH_DISP_N / MATH_PARA_N sentinels with OMML paragraphs via pandoc."""
     from docx import Document as DocxDoc
 
-    # Build sentinel → (latex_src, is_display, italic) map
-    math_map: dict[str, tuple[str, bool, bool]] = {}
+    # Build sentinel → (latex_src, is_display, italic, comment_id) map
+    math_map: dict[str, tuple[str, bool, bool, int]] = {}
     for proxy in content_proxies:
         if isinstance(proxy, MathDisplayProxy):
-            math_map[proxy.math_placeholder] = (proxy._node.math_src, True, False)
+            math_map[proxy.math_placeholder] = (proxy._node.math_src, True, False, 0)
         elif isinstance(proxy, HeadingProxy) and proxy.has_math:
-            math_map[proxy.math_placeholder] = (proxy._node.math_raw, False, False)
+            math_map[proxy.math_placeholder] = (
+                proxy._node.math_raw, False, False, getattr(proxy, 'comment_id', 0))
         elif isinstance(proxy, FigureProxy) and proxy.has_caption_math:
-            math_map[proxy.caption_math_placeholder] = (proxy._caption_text, False, True)
+            math_map[proxy.caption_math_placeholder] = (proxy._caption_text, False, True, 0)
 
     if not math_map:
         return
@@ -1093,6 +1118,26 @@ def _post_process_math(docx_path: str, content_proxies: list) -> None:
 
     NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
+    def _bracket_with_comment(p_el, cid: int) -> None:
+        """Wrap the whole OMML paragraph in a commentRangeStart/End pair plus a
+        CommentReference run, so a native Word comment can anchor to inline math.
+        comments.xml itself is written later by _post_process_comments()."""
+        pPr = p_el.find(f'{{{NS_W}}}pPr')
+        rng_start = etree.Element(f'{{{NS_W}}}commentRangeStart')
+        rng_start.set(f'{{{NS_W}}}id', str(cid))
+        if pPr is not None:
+            pPr.addnext(rng_start)
+        else:
+            p_el.insert(0, rng_start)
+        rng_end = etree.SubElement(p_el, f'{{{NS_W}}}commentRangeEnd')
+        rng_end.set(f'{{{NS_W}}}id', str(cid))
+        ref_run = etree.SubElement(p_el, f'{{{NS_W}}}r')
+        r_pr = etree.SubElement(ref_run, f'{{{NS_W}}}rPr')
+        r_style = etree.SubElement(r_pr, f'{{{NS_W}}}rStyle')
+        r_style.set(f'{{{NS_W}}}val', 'CommentReference')
+        ref_el = etree.SubElement(ref_run, f'{{{NS_W}}}commentReference')
+        ref_el.set(f'{{{NS_W}}}id', str(cid))
+
     doc = DocxDoc(docx_path)
     replaced = 0
     # Use iter() so paragraphs inside table cells are also found.
@@ -1102,7 +1147,7 @@ def _post_process_math(docx_path: str, content_proxies: list) -> None:
         txt = ''.join(t.text or '' for t in p_el.findall(f'.//{{{NS_W}}}t')).strip()
         if txt not in math_map:
             continue
-        src, display, italic = math_map[txt]
+        src, display, italic, comment_id = math_map[txt]
         new_p = _pandoc_to_para(src, display)
         if new_p is not None:
             # Apply italic to all text runs when the source is a figure caption.
@@ -1126,6 +1171,8 @@ def _post_process_math(docx_path: str, content_proxies: list) -> None:
                     new_p.replace(new_pPr, orig_copy)
                 else:
                     new_p.insert(0, orig_copy)
+            if comment_id:
+                _bracket_with_comment(new_p, comment_id)
             p_el.addnext(new_p)
             p_el.getparent().remove(p_el)
             replaced += 1

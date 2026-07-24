@@ -597,12 +597,12 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
 
         if pending_comment is not None and len(result) > before:
             target = result[before]
-            if target.type not in _COMMENTABLE_TYPES or target.has_math:
+            if target.type not in _COMMENTABLE_TYPES:
                 raise ValueError(
                     f"Comment by {pending_comment.comment_author!r} attaches "
                     f"to a {target.type!r} node, which cannot carry a comment "
                     f"(only headings, paragraphs, bullets, and numbered items "
-                    f"without inline math can)."
+                    f"can — inline math within them is fine)."
                 )
             target.comment_author = pending_comment.comment_author
             target.comment_body = pending_comment.comment_body
