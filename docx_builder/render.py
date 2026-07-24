@@ -1070,6 +1070,41 @@ def _post_process_comments(docx_path: str, comments: list[dict]) -> None:
     print(f'Post-processed {placed} native Word comment(s) into {docx_path}')
 
 
+_OMML_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+
+
+def _pandoc_math_para(src: str, display: bool):
+    """Convert LaTeX math (display or inline paragraph markdown) to an OMML
+    <w:p> lxml element via pandoc. `src` is markdown; for inline use it must
+    already carry its own $...$ delimiters. Returns None on failure."""
+    from docx import Document as DocxDoc
+
+    md = f'$$\n{src}\n$$\n' if display else src + '\n'
+    with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as f:
+        tmp = f.name
+    try:
+        result = subprocess.run(
+            ['pandoc', '-f', 'markdown+tex_math_dollars', '-t', 'docx', '-o', tmp],
+            input=md.encode('utf-8'),
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            return None
+        tmp_doc = DocxDoc(tmp)
+        for para in tmp_doc.paragraphs:
+            if para._p.find(f'.//{{{_OMML_NS}}}oMath') is not None or para.text.strip():
+                return para._p
+        return None
+    except Exception as exc:
+        print(f'  [math] pandoc error: {exc}')
+        return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _post_process_math(docx_path: str, content_proxies: list) -> None:
     """Replace MATH_DISP_N / MATH_PARA_N sentinels with OMML paragraphs via pandoc."""
     from docx import Document as DocxDoc
@@ -1088,33 +1123,7 @@ def _post_process_math(docx_path: str, content_proxies: list) -> None:
     if not math_map:
         return
 
-    def _pandoc_to_para(src: str, display: bool):
-        """Convert LaTeX math (display or inline paragraph) to an OMML lxml element."""
-        md = f'$$\n{src}\n$$\n' if display else src + '\n'
-        with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as f:
-            tmp = f.name
-        try:
-            result = subprocess.run(
-                ['pandoc', '-f', 'markdown+tex_math_dollars', '-t', 'docx', '-o', tmp],
-                input=md.encode('utf-8'),
-                capture_output=True,
-            )
-            if result.returncode != 0:
-                return None
-            tmp_doc = DocxDoc(tmp)
-            OMML_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
-            for para in tmp_doc.paragraphs:
-                if para._p.find(f'.//{{{OMML_NS}}}oMath') is not None or para.text.strip():
-                    return para._p
-            return None
-        except Exception as exc:
-            print(f'  [math] pandoc error: {exc}')
-            return None
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+    _pandoc_to_para = _pandoc_math_para
 
     NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
@@ -1182,6 +1191,86 @@ def _post_process_math(docx_path: str, content_proxies: list) -> None:
     if replaced:
         doc.save(docx_path)
         print(f'Post-processed {replaced} math expression(s) into {docx_path}')
+
+
+# Unescaped $...$ span (non-greedy). A backslash-escaped \$ is not a delimiter,
+# so literal-money like \$0.0042 stays text.
+_RE_INLINE_MATH_SPAN = re.compile(r'(?<!\\)\$(.+?)(?<!\\)\$', re.S)
+
+
+def _post_process_inline_math(docx_path: str) -> None:
+    """Render inline $...$ spans that survive the sentinel math pass as OMML.
+
+    The sentinel pass (_post_process_math) replaces a whole math *body*
+    paragraph with a pandoc-built one, but several render paths emit their text
+    verbatim and never go through it: table cells (cell.text = raw markdown),
+    table captions ("Table N: ..." strings), and headings. Any $...$ in those
+    reaches the DOCX as literal text. This pass walks every paragraph and
+    splices each unescaped $...$ span, in place within its text run, into an
+    inline <m:oMath>, leaving all surrounding text (and any other markdown it
+    carries — **bold**, [brackets], :ref{} sentinels) untouched. Body math
+    paragraphs no longer carry a literal $ by this point, so they are skipped
+    naturally.
+    """
+    from docx import Document as DocxDoc
+    from docx.oxml.ns import qn
+
+    NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    XML_SPACE = '{http://www.w3.org/XML/1998/namespace}space'
+    omath_cache: dict[str, object] = {}
+
+    def _omath_for(latex: str):
+        """Return a fresh (deep-copied) inline <m:oMath> for the given LaTeX."""
+        if latex not in omath_cache:
+            para = _pandoc_math_para(f'${latex}$', display=False)
+            om = para.find(f'.//{{{_OMML_NS}}}oMath') if para is not None else None
+            omath_cache[latex] = om
+        cached = omath_cache[latex]
+        return copy.deepcopy(cached) if cached is not None else None
+
+    def _text_run(text: str, rPr):
+        r = etree.Element(f'{{{NS_W}}}r')
+        if rPr is not None:
+            r.append(copy.deepcopy(rPr))
+        t = etree.SubElement(r, f'{{{NS_W}}}t')
+        t.set(XML_SPACE, 'preserve')
+        t.text = text
+        return r
+
+    doc = DocxDoc(docx_path)
+    converted = 0
+    for p_el in doc.element.body.iter(qn('w:p')):
+        for r_el in list(p_el.findall(qn('w:r'))):
+            t_el = r_el.find(qn('w:t'))
+            text = t_el.text if t_el is not None else None
+            if not text or not _RE_INLINE_MATH_SPAN.search(text):
+                continue
+            rPr = r_el.find(qn('w:rPr'))
+            pos = list(p_el).index(r_el)
+            new_nodes = []
+            idx = 0
+            ok = False
+            for m in _RE_INLINE_MATH_SPAN.finditer(text):
+                om = _omath_for(m.group(1))
+                if om is None:
+                    continue  # leave this span as literal text
+                if text[idx:m.start()]:
+                    new_nodes.append(_text_run(text[idx:m.start()], rPr))
+                new_nodes.append(om)
+                idx = m.end()
+                ok = True
+            if not ok:
+                continue
+            if text[idx:]:
+                new_nodes.append(_text_run(text[idx:], rPr))
+            for off, node in enumerate(new_nodes):
+                p_el.insert(pos + off, node)
+            p_el.remove(r_el)
+            converted += 1
+
+    if converted:
+        doc.save(docx_path)
+        print(f'Post-processed inline math in {converted} run(s) into {docx_path}')
 
 
 def _inline_to_anchor(inline_el) -> None:
@@ -2019,6 +2108,9 @@ def render(
     _post_process_figures(output_path, figure_title_style)
     # Post-process: replace MATH_DISP_N / MATH_PARA_N sentinels with OMML
     _post_process_math(output_path, content_proxies)
+    # Post-process: render inline $...$ spans left verbatim by non-body paths
+    # (table cells, table captions, headings)
+    _post_process_inline_math(output_path)
     # Post-process: insert Word bookmarks and REF fields for section cross-references
     _post_process_crossrefs(output_path, content_nodes, fig_map, tab_map,
                             figure_title_style)
