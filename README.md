@@ -3,7 +3,7 @@
 Compile WYSIWYG-friendly Markdown drafts into organisation DOCX templates.
 
 The engine implements a small Markdown dialect (acronym macros, figure /
-table / section cross-references, math, mermaid) whose sources read cleanly
+table / section cross-references, math, mermaid, ==highlight==) whose sources read cleanly
 in any Markdown preview *and* compile into a fully styled Word document:
 live REF-field cross-references, OMML math, Word-native TOC/LOF/LOT fields,
 template styles throughout.

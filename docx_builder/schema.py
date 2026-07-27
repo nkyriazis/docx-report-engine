@@ -11,6 +11,7 @@ class Run:
     italic: bool = False
     code: bool = False  # inline code span → monospace font in DOCX
     color: str = ''  # hex color or named color (e.g. 'red', '#FF0000')
+    highlight: bool = False  # ==mark== → Word text highlight (yellow)
     ref_id: str = ''  # non-empty → section cross-reference; text holds @@SECREF:id@@ sentinel
     fig_ref_id: str = ''  # non-empty → figure cross-reference; text holds @@FIGREF:id@@ sentinel
     tab_ref_id: str = ''  # non-empty → table cross-reference; text holds @@TABREF:id@@ sentinel

@@ -92,6 +92,8 @@ def _to_rt(runs: list[Run]) -> RichText:
             kwargs['font'] = 'Courier New'
         if run.color:
             kwargs['color'] = run.color
+        if run.highlight:
+            kwargs['highlight'] = 'yellow'
         rt.add(run.text, **kwargs)
     return rt
 
@@ -493,11 +495,17 @@ def _post_process_inline_runs(docx_path: str, inline_map: dict[str, list[Run]]) 
         if r_pr.find(f'{{{W}}}color') is None:
             r_pr.append(color_el)
 
+    def _set_highlight(r_pr):
+        if r_pr.find(f'{{{W}}}highlight') is None:
+            hl = OxmlElement('w:highlight')
+            hl.set(f'{{{W}}}val', 'yellow')
+            r_pr.append(hl)
+
     def _append_run(p_el, run: Run):
         if not run.text:
             return
         r_el = OxmlElement('w:r')
-        if run.bold or run.italic or run.code or run.color:
+        if run.bold or run.italic or run.code or run.color or run.highlight:
             r_pr = OxmlElement('w:rPr')
             if run.bold:
                 _set_bold(r_pr)
@@ -510,6 +518,8 @@ def _post_process_inline_runs(docx_path: str, inline_map: dict[str, list[Run]]) 
                 r_pr.append(fonts_el)
             if run.color:
                 _set_color(r_pr, run.color)
+            if run.highlight:
+                _set_highlight(r_pr)
             r_el.append(r_pr)
         t_el = OxmlElement('w:t')
         t_el.set(XML_SPACE, 'preserve')
@@ -663,7 +673,7 @@ def _runs_to_w_elements(parent, runs: list[Run], xml_space: str) -> None:
     bodies: plain formatted text only)."""
     for run in runs:
         r_el = etree.SubElement(parent, f'{{{_NS_W}}}r')
-        if run.bold or run.italic or run.code or run.color:
+        if run.bold or run.italic or run.code or run.color or run.highlight:
             r_pr = etree.SubElement(r_el, f'{{{_NS_W}}}rPr')
             if run.bold:
                 etree.SubElement(r_pr, f'{{{_NS_W}}}b')
@@ -676,6 +686,9 @@ def _runs_to_w_elements(parent, runs: list[Run], xml_space: str) -> None:
             if run.color:
                 color_el = etree.SubElement(r_pr, f'{{{_NS_W}}}color')
                 color_el.set(f'{{{_NS_W}}}val', run.color.lstrip('#'))
+            if run.highlight:
+                hl_el = etree.SubElement(r_pr, f'{{{_NS_W}}}highlight')
+                hl_el.set(f'{{{_NS_W}}}val', 'yellow')
         t_el = etree.SubElement(r_el, f'{{{_NS_W}}}t')
         t_el.set(xml_space, 'preserve')
         t_el.text = run.text
@@ -1013,7 +1026,7 @@ def _post_process_comments(docx_path: str, comments: list[dict]) -> None:
             p_el = etree.SubElement(w_comment, f'{{{_NS_W}}}p')
             for run in para_runs:
                 r_el = etree.SubElement(p_el, f'{{{_NS_W}}}r')
-                if run.bold or run.italic or run.code or run.color:
+                if run.bold or run.italic or run.code or run.color or run.highlight:
                     r_pr = etree.SubElement(r_el, f'{{{_NS_W}}}rPr')
                     if run.bold:
                         etree.SubElement(r_pr, f'{{{_NS_W}}}b')
@@ -1026,6 +1039,9 @@ def _post_process_comments(docx_path: str, comments: list[dict]) -> None:
                     if run.color:
                         color_el = etree.SubElement(r_pr, f'{{{_NS_W}}}color')
                         color_el.set(f'{{{_NS_W}}}val', run.color.lstrip('#'))
+                    if run.highlight:
+                        hl_el = etree.SubElement(r_pr, f'{{{_NS_W}}}highlight')
+                        hl_el.set(f'{{{_NS_W}}}val', 'yellow')
                 t_el = etree.SubElement(r_el, f'{{{_NS_W}}}t')
                 t_el.set(XML_SPACE, 'preserve')
                 t_el.text = run.text
@@ -1084,7 +1100,7 @@ def _pandoc_math_para(src: str, display: bool):
         tmp = f.name
     try:
         result = subprocess.run(
-            ['pandoc', '-f', 'markdown+tex_math_dollars', '-t', 'docx', '-o', tmp],
+            ['pandoc', '-f', 'markdown+tex_math_dollars+mark', '-t', 'docx', '-o', tmp],
             input=md.encode('utf-8'),
             capture_output=True,
         )

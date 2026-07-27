@@ -7,7 +7,11 @@ Two-pass pipeline:
 Inline formatting (bold, italic, code, math) is taken directly from the
 markdown-it inline token tree — there is no re-parsing of serialized text.
 The only regex layer left at the inline level handles syntax that is not
-markdown: :ref{}/:fig{}/:tab{} cross-references and color <span>s.
+markdown: :ref{}/:fig{}/:tab{} cross-references, color <span>s, and
+==highlight== marks. Highlight is a toggle (each == flips it), so it may
+span soft line breaks; on paragraphs with inline math it is left verbatim
+for pandoc's `mark` extension (see render._pandoc_math_para) rather than
+carried on the Run, since such paragraphs are rebuilt whole by pandoc.
 
 Generic API:
   parse_body(lines) → list[ContentNode]
@@ -39,6 +43,7 @@ _RE_INLINE_FEATURE = re.compile(
     r'|(?P<tabref>:tab\{(?P<tabid>[^}]+)\}:)'
     r'|(?P<span_open><span\s+style="[^"]*color:\s*(?P<color>[^;"]+)[^"]*"[^>]*>)'
     r'|(?P<span_close></span>)'
+    r'|(?P<mark>==)'
     r'|(?P<footref>@@FOOTREF:(?P<footkey>[^@]+)@@)'
 )
 
@@ -84,12 +89,13 @@ def _refs_to_sentinels(text: str) -> str:
 
 class _InlineState:
     """Formatting state while walking an inline token tree."""
-    __slots__ = ('bold', 'italic', 'colors')
+    __slots__ = ('bold', 'italic', 'colors', 'mark')
 
     def __init__(self) -> None:
         self.bold = 0
         self.italic = 0
         self.colors: list[str] = []
+        self.mark = 0  # ==...== highlight: toggled 0/1 by each == marker
 
     def make_run(self, text: str, **extra) -> Run:
         return Run(
@@ -97,6 +103,7 @@ class _InlineState:
             bold=self.bold > 0,
             italic=self.italic > 0,
             color=self.colors[-1] if self.colors else '',
+            highlight=self.mark > 0,
             **extra,
         )
 
@@ -126,6 +133,8 @@ def _emit_text(text: str, state: _InlineState, runs: list[Run]) -> None:
         elif m.group('span_close'):
             if state.colors:
                 state.colors.pop()
+        elif m.group('mark'):
+            state.mark ^= 1
         pos = m.end()
     tail = text[pos:]
     if tail:
@@ -141,8 +150,8 @@ def _merge_adjacent(runs: list[Run]) -> list[Run]:
             prev is not None
             and not (prev.ref_id or prev.fig_ref_id or prev.tab_ref_id or prev.footnote_key)
             and not (run.ref_id or run.fig_ref_id or run.tab_ref_id or run.footnote_key)
-            and (prev.bold, prev.italic, prev.code, prev.color)
-            == (run.bold, run.italic, run.code, run.color)
+            and (prev.bold, prev.italic, prev.code, prev.color, prev.highlight)
+            == (run.bold, run.italic, run.code, run.color, run.highlight)
         ):
             prev.text += run.text
         else:
@@ -233,7 +242,8 @@ def _inline_text(inline_token) -> str:
 
 def _math_raw(assembled: str) -> str:
     """Pandoc input for a paragraph with inline math: acronym-stripped,
-    cross-references converted to sentinels."""
+    cross-references converted to sentinels. Highlight (==...==) is left
+    verbatim for pandoc's `mark` extension to render."""
     return _refs_to_sentinels(RE_ACRONYM.sub(lambda m: m.group(1), assembled))
 
 
