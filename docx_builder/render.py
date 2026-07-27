@@ -1827,17 +1827,21 @@ def _post_process_crossrefs(
                 sut.text = suffix
                 su.append(sut)
                 new_runs.append(su)
-            # Anchor insertion at the run immediately following the split block
-            # (positionally correct for mid-paragraph splits, not just paragraph-initial ones).
-            last_target_idx = max(runs.index(r) for r in target_runs)
-            next_run = runs[last_target_idx + 1] if last_target_idx + 1 < len(runs) else None
+            # Anchor insertion on the split block's true next sibling in the
+            # element tree, which may be an <m:oMath> rather than a w:r. Using
+            # the next *text run* (runs[idx+1]) skips over any interleaved
+            # inline math, so a repaired run would land on the wrong side of it
+            # and reorder the paragraph. The sentinel carries no math, so its
+            # spanning runs are contiguous and the last one's sibling is the
+            # correct anchor.
+            anchor = target_runs[-1].getnext()
             for r in target_runs:
                 p.remove(r)
-            if next_run is not None:
+            if anchor is not None:
                 # addprevious on a fixed anchor: each call lands immediately
                 # before it, so iterate in forward order to keep new_runs in sequence.
                 for nr in new_runs:
-                    next_run.addprevious(nr)
+                    anchor.addprevious(nr)
             else:
                 for nr in new_runs:
                     p.append(nr)
