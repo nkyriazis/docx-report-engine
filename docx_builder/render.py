@@ -20,11 +20,18 @@ _RE_HAS_INLINE_MATH = re.compile(r'\$[^$\n]+\$')
 _RE_SECREF_CELL = re.compile(r':ref\{([^}]+)\}:')
 
 from docx import Document  # type: ignore
+from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
 from docx.shared import Cm  # type: ignore
 from docxtpl import DocxTemplate, InlineImage, RichText  # type: ignore
 from lxml import etree  # type: ignore
 
 from .schema import ContentNode, Run, finalize_content
+
+_CELL_ALIGN = {
+    'left': WD_ALIGN_PARAGRAPH.LEFT,
+    'center': WD_ALIGN_PARAGRAPH.CENTER,
+    'right': WD_ALIGN_PARAGRAPH.RIGHT,
+}
 
 # XML namespace URIs used in image post-processing
 _NS_W  = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -594,18 +601,32 @@ def _post_process_tables(docx_path: str, tables_list: list[ContentNode]) -> None
         # Build the table (appended to end initially)
         tbl = doc.add_table(rows=n_rows, cols=n_cols, style='Table Grid')
 
+        aligns = node.tbl_aligns or []
+
+        def _align(cell, ci: int) -> None:
+            """Set the cell paragraph's justification from the column's markdown
+            alignment. Always explicit — a paragraph with no w:jc inherits Word's
+            math default (m:defJc centerGroup), which centres cells holding only
+            math and leaves the rest of the column flush left.
+            """
+            want = aligns[ci] if ci < len(aligns) else 'left'
+            cell.paragraphs[0].alignment = _CELL_ALIGN.get(want, WD_ALIGN_PARAGRAPH.LEFT)
+
         # Header row — bold
         for ci, hdr in enumerate(headers):
             cell = tbl.rows[0].cells[ci]
             cell.text = hdr
             for run in cell.paragraphs[0].runs:
                 run.bold = True
+            _align(cell, ci)
 
         # Data rows
         for ri, row_data in enumerate(rows):
             for ci, val in enumerate(row_data[:n_cols]):
                 val = _RE_SECREF_CELL.sub(lambda m: f'@@SECREF:{m.group(1)}@@', val)
-                tbl.rows[ri + 1].cells[ci].text = val
+                cell = tbl.rows[ri + 1].cells[ci]
+                cell.text = val
+                _align(cell, ci)
 
         # Move table to immediately after the placeholder paragraph
         para._p.addnext(tbl._tbl)

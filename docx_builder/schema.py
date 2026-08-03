@@ -55,6 +55,7 @@ class ContentNode:
     tbl_headers: list[str] = field(default_factory=list)
     tbl_rows: list[list[str]] = field(default_factory=list)
     tbl_caption: list[Run] = field(default_factory=list)
+    tbl_aligns: list[str] = field(default_factory=list)  # per column: 'left'|'center'|'right'
 
     # Math fields
     math_src: str = ''          # LaTeX source for 'math_display' nodes

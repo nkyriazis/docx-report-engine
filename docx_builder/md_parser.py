@@ -378,9 +378,18 @@ def _parse_list_item(tokens: list, i: int, kind: str, depth: int) -> tuple[list[
 
 
 def _parse_table(tokens: list, i: int) -> tuple[ContentNode, int]:
-    """Parse table_open ... tbody_close. Return (node, new_i)."""
+    """Parse table_open ... tbody_close. Return (node, new_i).
+
+    The delimiter row's alignment (`---:`, `:---:`, `:---`) reaches us as a
+    `style="text-align:..."` attribute on each th/td token. Columns written
+    without one are recorded as 'left' rather than left unset, because an
+    unaligned cell inherits Word's math default (``m:defJc centerGroup``),
+    which centres a cell holding nothing but math while leaving its
+    neighbours flush left.
+    """
     headers: list[str] = []
     rows: list[list[str]] = []
+    aligns: list[str] = []
     current_row: list[str] = []
     in_header = False
 
@@ -395,6 +404,9 @@ def _parse_table(tokens: list, i: int) -> tuple[ContentNode, int]:
             j += 1
             break
         elif tk in ("th_open", "td_open"):
+            if in_header:
+                style = tokens[j].attrGet("style") or ""
+                aligns.append(style.split("text-align:")[-1].strip() if style else "left")
             if j + 1 < len(tokens) and tokens[j + 1].type == "inline":
                 current_row.append(_inline_text(tokens[j + 1]).strip())
         elif tk == "tr_close":
@@ -406,7 +418,8 @@ def _parse_table(tokens: list, i: int) -> tuple[ContentNode, int]:
                 current_row = []
         j += 1
 
-    return (ContentNode(type="table", tbl_headers=headers, tbl_rows=rows), j)
+    return (ContentNode(type="table", tbl_headers=headers, tbl_rows=rows,
+                        tbl_aligns=aligns), j)
 
 
 def _structural_pass(tokens: list) -> list[ContentNode]:
