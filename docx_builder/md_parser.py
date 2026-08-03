@@ -592,6 +592,7 @@ def _process_macros(nodes: list[ContentNode]) -> list[ContentNode]:
                 tab = pending_tab.pop(cur_tab)
                 tab.tbl_headers = node.tbl_headers
                 tab.tbl_rows = node.tbl_rows
+                tab.tbl_aligns = node.tbl_aligns
                 result.append(tab)
                 cur_tab = None
             elif node.tbl_headers and node.tbl_rows:
